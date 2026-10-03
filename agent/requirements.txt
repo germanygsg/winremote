@@ -1,0 +1,4 @@
+# WinRemote agent dependencies
+uiautomation
+mss
+Pillow
