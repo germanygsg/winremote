@@ -254,6 +254,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/input/type_text": self._handle_type_text,
                 "/input/press_key": self._handle_press_key,
                 "/js/execute": self._handle_js_execute,
+                "/js/eval": self._handle_js_eval,
                 "/uia/expand": self._handle_expand,
                 "/uia/select": self._handle_select,
                 "/uia/focus": self._handle_focus,
@@ -689,6 +690,31 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             import traceback
             self._send(500, {"error": f"js_execute failed: {e}", "trace": traceback.format_exc()[:500]})
+
+    def _handle_js_eval(self, body):
+        """Execute JS via the Tauri app's local HTTP eval server (127.0.0.1:48721).
+        100% reliable DOM access, no PowerShell, no UIA, no synthetic input.
+        Body: {script: str}
+        Returns: {ok: True} or {ok: False, error}"""
+        script = body.get("script", "")
+        if not script:
+            self._send(404, {"error": "script required"})
+            return
+        try:
+            import json as json_lib
+            import urllib.request
+            payload = json_lib.dumps({"script": script}).encode('utf-8')
+            req = urllib.request.Request(
+                'http://127.0.0.1:48721/eval',
+                data=payload,
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json_lib.loads(resp.read().decode('utf-8'))
+                self._send(200, result)
+        except Exception as e:
+            self._send(500, {"error": f"js_eval failed: {e}"})
 
     def _handle_set_value(self, body):
         el = _get_handle(body.get("handle", ""))

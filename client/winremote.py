@@ -112,6 +112,11 @@ class WinRemote:
         Bypasses all synthetic-input limitations."""
         return self._req("POST", "/js/execute", {"script": script, "window": window})
 
+    def js_eval(self, script):
+        """Execute JS via Tauri app's local HTTP eval server.
+        100% reliable DOM access. No PowerShell, no UIA."""
+        return self._req("POST", "/js/eval", {"script": script})
+
     def expand(self, handle, action="expand"):
         """Expand/collapse a dropdown via ExpandCollapsePattern.
         action: "expand"|"collapse"|"toggle"."""
