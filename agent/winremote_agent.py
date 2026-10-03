@@ -249,7 +249,10 @@ class Handler(BaseHTTPRequestHandler):
                 "/uia/find": self._handle_find,
                 "/uia/invoke": self._handle_invoke,
                 "/uia/set_value": self._handle_set_value,
+                "/uia/expand": self._handle_expand,
+                "/uia/select": self._handle_select,
                 "/uia/focus": self._handle_focus,
+                "/uia/click_at": self._handle_click_at,
                 "/input/sendkeys": self._handle_sendkeys,
                 "/window/activate": self._handle_activate,
             }[path](body)
@@ -345,6 +348,44 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send(400, {"error": f"invoke failed: {e}"})
 
+    def _handle_expand(self, body):
+        """Expand or collapse a dropdown/combobox via ExpandCollapsePattern.
+        Body: {handle, action: "expand"|"collapse"|"toggle"}"""
+        el = _get_handle(body.get("handle", ""))
+        if not el:
+            self._send(404, {"error": "stale or unknown handle; call /uia/find first"})
+            return
+        action = body.get("action", "expand")
+        try:
+            pattern = el.GetExpandCollapsePattern()
+            if action == "expand":
+                pattern.Expand()
+            elif action == "collapse":
+                pattern.Collapse()
+            else:
+                # Toggle based on current state
+                state = pattern.ExpandCollapseState
+                if state == auto.ExpandCollapseState.Expanded:
+                    pattern.Collapse()
+                else:
+                    pattern.Expand()
+            self._send(200, {"ok": True, "action": action})
+        except Exception as e:
+            self._send(400, {"error": f"expand failed: {e}"})
+
+    def _handle_select(self, body):
+        """Select an option via SelectionItemPattern.
+        Body: {handle} — handle of the option element to select."""
+        el = _get_handle(body.get("handle", ""))
+        if not el:
+            self._send(404, {"error": "stale or unknown handle; call /uia/find first"})
+            return
+        try:
+            el.GetSelectionItemPattern().Select()
+            self._send(200, {"ok": True})
+        except Exception as e:
+            self._send(400, {"error": f"select failed: {e}"})
+
     def _handle_set_value(self, body):
         el = _get_handle(body.get("handle", ""))
         if not el:
@@ -365,8 +406,10 @@ class Handler(BaseHTTPRequestHandler):
                       "Add-Type -AssemblyName System.Windows.Forms; "
                       "[System.Windows.Forms.SendKeys]::SendWait('^v'); "
                       "Start-Sleep -m 200; Set-Clipboard ''")
-                subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                               capture_output=True, timeout=15)
+                subprocess.run(
+                    [r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                     "-NoProfile", "-Command", ps],
+                    capture_output=True, timeout=15)
                 self._send(200, {"ok": True, "method": "clipboard_paste"})
             except Exception as e2:
                 self._send(500, {"error": f"value_pattern: {e}; paste: {e2}"})
@@ -379,13 +422,24 @@ class Handler(BaseHTTPRequestHandler):
         el.SetFocus()
         self._send(200, {"ok": True})
 
+    def _handle_click_at(self, body):
+        # Real mouse click at screen coordinates (for elements UIA can't invoke)
+        import ctypes
+        x, y = int(body.get("x", 0)), int(body.get("y", 0))
+        ctypes.windll.user32.SetCursorPos(x, y)
+        ctypes.windll.user32.mouse_event(0x02, 0, 0, 0, 0)  # left down
+        ctypes.windll.user32.mouse_event(0x04, 0, 0, 0, 0)  # left up
+        self._send(200, {"ok": True, "x": x, "y": y})
+
     def _handle_sendkeys(self, body):
         import subprocess
         keys = body.get("keys", "").replace("'", "''")
         ps = ("Add-Type -AssemblyName System.Windows.Forms; "
               f"[System.Windows.Forms.SendKeys]::SendWait('{keys}')")
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                       capture_output=True, timeout=15)
+        subprocess.run(
+            [r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+             "-NoProfile", "-Command", ps],
+            capture_output=True, timeout=15)
         self._send(200, {"ok": True})
 
     def _handle_activate(self, body):

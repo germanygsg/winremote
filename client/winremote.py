@@ -88,8 +88,41 @@ class WinRemote:
         """Set text on an edit control. Works on WebView2 inputs via ValuePattern."""
         return self._req("POST", "/uia/set_value", {"handle": handle, "value": value})
 
+    def expand(self, handle, action="expand"):
+        """Expand/collapse a dropdown via ExpandCollapsePattern.
+        action: "expand"|"collapse"|"toggle"."""
+        return self._req("POST", "/uia/expand", {"handle": handle, "action": action})
+
+    def select(self, handle):
+        """Select an option via SelectionItemPattern."""
+        return self._req("POST", "/uia/select", {"handle": handle})
+
+    def select_dropdown_option(self, dropdown_name, option_name, window="MedRecPlus"):
+        """High-level: open a dropdown by name, find option by name, select it.
+        Returns (dropdown_handle, option_handle)."""
+        # Find the dropdown/combobox
+        dropdowns = self.find(window=window, subname=dropdown_name, limit=5)
+        if not dropdowns:
+            raise RuntimeError(f"Dropdown '{dropdown_name}' not found")
+        dh = dropdowns[0]["handle"]
+        # Expand it
+        self.expand(dh, "expand")
+        # Find the option (it appears after expansion)
+        import time; time.sleep(0.5)
+        options = self.find(window=window, subname=option_name, limit=10)
+        # Filter to actual options (not the dropdown itself)
+        for opt in options:
+            if opt["handle"] != dh:
+                self.select(opt["handle"])
+                return dh, opt["handle"]
+        raise RuntimeError(f"Option '{option_name}' not found in dropdown '{dropdown_name}'")
+
     def focus(self, handle):
         return self._req("POST", "/uia/focus", {"handle": handle})
+
+    def click_at(self, x, y):
+        """Real mouse click at screen coordinates."""
+        return self._req("POST", "/uia/click_at", {"x": x, "y": y})
 
     def sendkeys(self, keys):
         """SendKeys string, e.g. '{ENTER}', '^v' (Ctrl+V)."""
