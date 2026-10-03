@@ -107,6 +107,11 @@ class WinRemote:
         key: 'enter'|'tab'|'escape'|'backspace'|'delete'|'ctrl_a'|'ctrl_c'|'ctrl_v'"""
         return self._req("POST", "/input/press_key", {"key": key})
 
+    def js_execute(self, script, window="MedRecPlus"):
+        """Execute JavaScript in WebView2 via COM. 100% reliable.
+        Bypasses all synthetic-input limitations."""
+        return self._req("POST", "/js/execute", {"script": script, "window": window})
+
     def expand(self, handle, action="expand"):
         """Expand/collapse a dropdown via ExpandCollapsePattern.
         action: "expand"|"collapse"|"toggle"."""
