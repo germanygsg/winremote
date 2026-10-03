@@ -21,10 +21,19 @@ class WinRemoteError(Exception):
 
 
 class WinRemote:
-    def __init__(self, host, port=8765, token="", timeout=30):
+    def __init__(self, host, port=8765, token="", timeout=30, proxy=None):
         self.base = f"http://{host}:{port}"
         self.token = token
         self.timeout = timeout
+        # For Tailscale IPs from the Hatch VM, route via the egress proxy
+        # that supports CONNECT (same one SSH uses). Default: hatch-egress-proxy:3130
+        if proxy is None and host.startswith("100."):
+            proxy = "http://hatch-egress-proxy:3130"
+        if proxy:
+            self.opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        else:
+            self.opener = urllib.request.build_opener()
 
     def _req(self, method, path, body=None, raw_response=False):
         url = self.base + path
@@ -34,7 +43,7 @@ class WinRemote:
             "Authorization": f"Bearer {self.token}",
         })
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with self.opener.open(req, timeout=self.timeout) as resp:
                 if raw_response:
                     return resp.read(), resp.headers.get("Content-Type", "")
                 return json.loads(resp.read() or b"{}")
