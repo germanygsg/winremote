@@ -251,6 +251,8 @@ class Handler(BaseHTTPRequestHandler):
                 "/uia/set_value": self._handle_set_value,
                 "/uia/set_value_at": self._handle_set_value_at,
                 "/input/paste_text": self._handle_paste_text,
+                "/input/type_text": self._handle_type_text,
+                "/input/press_key": self._handle_press_key,
                 "/uia/expand": self._handle_expand,
                 "/uia/select": self._handle_select,
                 "/uia/focus": self._handle_focus,
@@ -438,8 +440,16 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_paste_text(self, body):
         """Paste text at current focus via clipboard. No UIA needed.
         Caller must click to focus the target field first (real click).
-        Body: {text}"""
+        Body: {text} or {from_file: path}"""
         text = body.get("text", "")
+        from_file = body.get("from_file", "")
+        if from_file:
+            try:
+                with open(from_file, 'r', encoding='utf-8') as f:
+                    text = f.read().strip()
+            except Exception as e:
+                self._send(500, {"error": f"read file failed: {e}"})
+                return
         if not text:
             self._send(400, {"error": "text required"})
             return
@@ -461,6 +471,140 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "method": "paste_text"})
         except Exception as e:
             self._send(500, {"error": f"paste_text failed: {e}"})
+
+    def _handle_type_text(self, body):
+        """Type text via ctypes SendInput with KEYEVENTF_UNICODE.
+        Direct Windows API, no PowerShell. Sends real Unicode input events
+        that WebView2 accepts and React processes correctly.
+        Body: {text}"""
+        text = body.get("text", "")
+        if not text:
+            self._send(400, {"error": "text required"})
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            # INPUT structure for SendInput
+            class KEYBDINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("wVk", wintypes.WORD),
+                    ("wScan", wintypes.WORD),
+                    ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+                ]
+
+            class INPUT(ctypes.Structure):
+                _fields_ = [
+                    ("type", wintypes.DWORD),
+                    ("ki", KEYBDINPUT),
+                ]
+
+            INPUT_KEYBOARD = 1
+            KEYEVENTF_UNICODE = 0x0004
+            KEYEVENTF_KEYUP = 0x0002
+
+            user32 = ctypes.windll.user32
+
+            inputs = []
+            for ch in text:
+                # Key down
+                ki_down = KEYBDINPUT(
+                    wVk=0,
+                    wScan=ord(ch),
+                    dwFlags=KEYEVENTF_UNICODE,
+                    time=0,
+                    dwExtraInfo=None,
+                )
+                inputs.append(INPUT(type=INPUT_KEYBOARD, ki=ki_down))
+                # Key up
+                ki_up = KEYBDINPUT(
+                    wVk=0,
+                    wScan=ord(ch),
+                    dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                    time=0,
+                    dwExtraInfo=None,
+                )
+                inputs.append(INPUT(type=INPUT_KEYBOARD, ki=ki_up))
+
+            n = len(inputs)
+            arr = (INPUT * n)(*inputs)
+            sent = user32.SendInput(n, arr, ctypes.sizeof(INPUT))
+            if sent != n:
+                self._send(500, {"error": f"SendInput sent {sent}/{n}"})
+            else:
+                self._send(200, {"ok": True, "method": "send_input_unicode", "chars": len(text)})
+        except Exception as e:
+            self._send(500, {"error": f"type_text failed: {e}"})
+
+    def _handle_press_key(self, body):
+        """Press a special key via ctypes SendInput. No PowerShell.
+        Body: {key: 'enter'|'tab'|'escape'|'backspace'|'delete'|'ctrl_a'|'ctrl_c'|'ctrl_v'}}"""
+        key = body.get("key", "").lower()
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            VK_CODES = {
+                'enter': 0x0D,
+                'tab': 0x09,
+                'escape': 0x1B,
+                'backspace': 0x08,
+                'delete': 0x2E,
+                'ctrl_a': (0x11, 0x41),  # Ctrl+A
+                'ctrl_c': (0x11, 0x43),  # Ctrl+C
+                'ctrl_v': (0x11, 0x56),  # Ctrl+V
+            }
+
+            class KEYBDINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("wVk", wintypes.WORD),
+                    ("wScan", wintypes.WORD),
+                    ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+                ]
+
+            class INPUT(ctypes.Structure):
+                _fields_ = [
+                    ("type", wintypes.DWORD),
+                    ("ki", KEYBDINPUT),
+                ]
+
+            INPUT_KEYBOARD = 1
+            KEYEVENTF_KEYUP = 0x0002
+
+            user32 = ctypes.windll.user32
+
+            def make_input(vk, flags=0):
+                return INPUT(
+                    type=INPUT_KEYBOARD,
+                    ki=KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=None)
+                )
+
+            inputs = []
+            if key.startswith('ctrl_'):
+                vk_ctrl, vk_key = VK_CODES[key]
+                # Ctrl down, key down, key up, Ctrl up
+                inputs.append(make_input(vk_ctrl, 0))
+                inputs.append(make_input(vk_key, 0))
+                inputs.append(make_input(vk_key, KEYEVENTF_KEYUP))
+                inputs.append(make_input(vk_ctrl, KEYEVENTF_KEYUP))
+            elif key in VK_CODES:
+                vk = VK_CODES[key]
+                inputs.append(make_input(vk, 0))
+                inputs.append(make_input(vk, KEYEVENTF_KEYUP))
+            else:
+                self._send(400, {"error": f"unknown key: {key}"})
+                return
+
+            n = len(inputs)
+            arr = (INPUT * n)(*inputs)
+            sent = user32.SendInput(n, arr, ctypes.sizeof(INPUT))
+            self._send(200, {"ok": True, "method": "send_input_key", "key": key, "sent": sent})
+        except Exception as e:
+            self._send(500, {"error": f"press_key failed: {e}"})
 
     def _handle_set_value(self, body):
         el = _get_handle(body.get("handle", ""))

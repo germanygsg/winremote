@@ -97,6 +97,16 @@ class WinRemote:
         """Paste text at current focus via clipboard. Click to focus first."""
         return self._req("POST", "/input/paste_text", {"text": text})
 
+    def type_text(self, text):
+        """Type text via ctypes SendInput (Unicode). No PowerShell.
+        Direct Windows API, reliable for WebView2."""
+        return self._req("POST", "/input/type_text", {"text": text})
+
+    def press_key(self, key):
+        """Press special key via ctypes SendInput. No PowerShell.
+        key: 'enter'|'tab'|'escape'|'backspace'|'delete'|'ctrl_a'|'ctrl_c'|'ctrl_v'"""
+        return self._req("POST", "/input/press_key", {"key": key})
+
     def expand(self, handle, action="expand"):
         """Expand/collapse a dropdown via ExpandCollapsePattern.
         action: "expand"|"collapse"|"toggle"."""
