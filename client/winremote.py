@@ -61,9 +61,15 @@ class WinRemote:
     def health(self):
         return self._req("GET", "/health")
 
-    def screenshot(self, monitor=1):
-        """Returns (png_bytes, content_type)."""
-        return self._req("POST", "/screenshot", {"monitor": monitor}, raw_response=True)
+    def screenshot(self, monitor=1, window=None, format="png", quality=75, scale=1.0):
+        """Returns (image_bytes, content_type).
+        window: crop to this window's rect (substring name match).
+        format: 'png' or 'jpeg'. quality: jpeg quality 1-100. scale: downscale factor.
+        """
+        return self._req("POST", "/screenshot", {
+            "monitor": monitor, "window": window,
+            "format": format, "quality": quality, "scale": scale,
+        }, raw_response=True)
 
     def tree(self, window=None, max_depth=5):
         return self._req("POST", "/uia/tree", {"window": window, "max_depth": max_depth})
