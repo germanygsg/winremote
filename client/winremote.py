@@ -98,23 +98,34 @@ class WinRemote:
         return self._req("POST", "/uia/select", {"handle": handle})
 
     def select_dropdown_option(self, dropdown_name, option_name, window="MedRecPlus"):
-        """High-level: open a dropdown by name, find option by name, select it.
-        Returns (dropdown_handle, option_handle)."""
-        # Find the dropdown/combobox
-        dropdowns = self.find(window=window, subname=dropdown_name, limit=5)
+        """High-level: open a Joy UI Select dropdown by name, click the option.
+        Uses real coordinate clicks (click_at) because WebView2 doesn't expose
+        ExpandCollapsePattern for custom dropdowns. The dropdown button is
+        located via UIA, clicked to open, then the option is found and clicked.
+        Returns (dropdown_rect, option_rect)."""
+        import time
+        # Find the dropdown (the visible text element)
+        dropdowns = self.find(window=window, name=dropdown_name, limit=5)
         if not dropdowns:
             raise RuntimeError(f"Dropdown '{dropdown_name}' not found")
-        dh = dropdowns[0]["handle"]
-        # Expand it
-        self.expand(dh, "expand")
-        # Find the option (it appears after expansion)
-        import time; time.sleep(0.5)
-        options = self.find(window=window, subname=option_name, limit=10)
-        # Filter to actual options (not the dropdown itself)
+        drect = dropdowns[0].get("rect")
+        if not drect:
+            raise RuntimeError(f"Dropdown '{dropdown_name}' has no rect")
+        # Click the dropdown button (offset right from text to hit the button area)
+        dx = drect["x"] + 200
+        dy = drect["y"] + drect["h"] // 2
+        self.click_at(dx, dy)
+        time.sleep(1.0)
+        # Find the option
+        options = self.find(window=window, name=option_name, limit=10)
         for opt in options:
-            if opt["handle"] != dh:
-                self.select(opt["handle"])
-                return dh, opt["handle"]
+            orect = opt.get("rect")
+            if orect and orect["w"] > 0:
+                ox = orect["x"] + orect["w"] // 2
+                oy = orect["y"] + orect["h"] // 2
+                self.click_at(ox, oy)
+                time.sleep(0.5)
+                return drect, orect
         raise RuntimeError(f"Option '{option_name}' not found in dropdown '{dropdown_name}'")
 
     def focus(self, handle):
