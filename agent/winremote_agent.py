@@ -27,12 +27,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 
-# --- Dependencies (installed via setup/install.bat) ---
-#   pip install uiautomation mss
 try:
     import uiautomation as auto
+    import comtypes
 except ImportError:
     auto = None
+    comtypes = None
 
 try:
     from mss import mss
@@ -41,19 +41,47 @@ except ImportError:
 
 
 # ----------------------------------------------------------------------------
-# UIA helpers
+# UIA helpers (uiautomation library API)
 # ----------------------------------------------------------------------------
 
-def _cond_name(name):
-    return auto.PropertyCondition(auto.ControlType, None)  # placeholder
+CONTROL_TYPE_MAP = {
+    "button": "ButtonControl",
+    "edit": "EditControl",
+    "text": "TextControl",
+    "window": "WindowControl",
+    "pane": "PaneControl",
+    "document": "DocumentControl",
+    "combobox": "ComboBoxControl",
+    "listitem": "ListItemControl",
+    "menuitem": "MenuItemControl",
+    "checkbox": "CheckBoxControl",
+    "group": "GroupControl",
+    "image": "ImageControl",
+}
 
-def find_window(name):
-    """Find a top-level window by name."""
-    root = auto.GetRootControl()
-    cond = auto.PropertyCondition(auto.NameProperty, name)
-    return root.FindFirstChild(auto.TreeScope.Children, cond)
+def _com_init():
+    if comtypes:
+        try:
+            comtypes.CoInitialize()
+        except Exception:
+            pass
 
-def element_to_dict(el, depth=0, max_depth=6):
+def find_window(subname):
+    """Find a top-level window by substring name."""
+    _com_init()
+    try:
+        win = auto.WindowControl(searchDepth=1, SubName=subname)
+        return win if win.Exists(1, 0.2) else None
+    except Exception:
+        return None
+
+def _control_class(control_type):
+    if not control_type:
+        return auto.Control
+    cls_name = CONTROL_TYPE_MAP.get(control_type.lower(), "Control")
+    return getattr(auto, cls_name, auto.Control)
+
+def element_to_dict(el, depth=0, max_depth=5):
     """Serialize a UIA element (and children) to a dict."""
     try:
         d = {
@@ -61,30 +89,29 @@ def element_to_dict(el, depth=0, max_depth=6):
             "control_type": el.ControlTypeName or "",
             "automation_id": el.AutomationId or "",
             "class_name": el.ClassName or "",
-            "enabled": bool(el.IsEnabled),
         }
+        try:
+            d["enabled"] = bool(el.IsEnabled)
+        except Exception:
+            d["enabled"] = True
         try:
             r = el.BoundingRectangle
             d["rect"] = {"x": r.left, "y": r.top, "w": r.width(), "h": r.height()}
         except Exception:
             d["rect"] = None
-        # Supported patterns (what we can do with this element)
         patterns = []
-        try:
-            if el.GetPattern(auto.PatternId.ValuePattern):
-                patterns.append("set_value")
-        except Exception:
-            pass
-        try:
-            if el.GetPattern(auto.PatternId.InvokePattern):
-                patterns.append("invoke")
-        except Exception:
-            pass
-        try:
-            if el.GetPattern(auto.PatternId.ExpandCollapsePattern):
-                patterns.append("expand")
-        except Exception:
-            pass
+        for pid_name, label in [
+            ("ValuePattern", "set_value"),
+            ("InvokePattern", "invoke"),
+            ("ExpandCollapsePattern", "expand"),
+            ("TogglePattern", "toggle"),
+        ]:
+            try:
+                pid = getattr(auto.PatternId, pid_name)
+                if el.GetPattern(pid):
+                    patterns.append(label)
+            except Exception:
+                pass
         d["patterns"] = patterns
         if depth < max_depth:
             children = []
@@ -99,52 +126,23 @@ def element_to_dict(el, depth=0, max_depth=6):
     except Exception as e:
         return {"error": str(e)}
 
-def find_elements(root, name=None, control_type=None, automation_id=None,
-                   scope="descendants", limit=50):
-    """Find elements matching criteria. Returns list of dicts with a handle id."""
+def find_elements(root, subname=None, control_type=None, automation_id=None, limit=50):
+    """Find elements by substring name / type. Returns list of (handle, dict)."""
+    _com_init()
     results = []
-    try:
-        conds = []
-        if name:
-            # Support substring match via manual filter (UIA PropertyCondition is exact)
-            pass
-        if control_type:
-            ct_map = {
-                "button": auto.ControlType.ButtonControl,
-                "edit": auto.ControlType.EditControl,
-                "text": auto.ControlType.TextControl,
-                "window": auto.ControlType.WindowControl,
-                "pane": auto.ControlType.PaneControl,
-                "document": auto.ControlType.DocumentControl,
-                "combobox": auto.ControlType.ComboBoxControl,
-                "listitem": auto.ControlType.ListItemControl,
-                "menuitem": auto.ControlType.MenuItemControl,
-                "checkbox": auto.ControlType.CheckBoxControl,
-            }
-            ct = ct_map.get(control_type.lower())
-            if ct:
-                conds.append(auto.PropertyCondition(auto.ControlTypeProperty, ct))
-        if automation_id:
-            conds.append(auto.PropertyCondition(auto.AutomationIdProperty, automation_id))
-
-        if len(conds) == 1:
-            cond = conds[0]
-        elif len(conds) > 1:
-            cond = auto.AndCondition(*conds)
-        else:
-            cond = auto.TrueCondition
-
-        scope_map = {
-            "children": auto.TreeScope.Children,
-            "descendants": auto.TreeScope.Descendants,
-        }
-        found = root.FindAllControls(scope_map.get(scope, auto.TreeScope.Descendants), cond)
-        for el in found:
-            if len(results) >= limit:
+    cls = _control_class(control_type)
+    # uiautomation finds one at a time via foundIndex; iterate
+    idx = 1
+    while len(results) < limit:
+        try:
+            kwargs = {"searchFromControl": root, "foundIndex": idx}
+            if subname:
+                kwargs["SubName"] = subname
+            if automation_id:
+                kwargs["AutomationId"] = automation_id
+            el = cls(searchDepth=0xFFFFFFFF, **kwargs)
+            if not el.Exists(0.5, 0.1):
                 break
-            # substring name filter
-            if name and name.lower() not in (el.Name or "").lower():
-                continue
             hid = _register_handle(el)
             d = {
                 "handle": hid,
@@ -158,13 +156,16 @@ def find_elements(root, name=None, control_type=None, automation_id=None,
             except Exception:
                 d["rect"] = None
             results.append(d)
-    except Exception as e:
-        return {"error": str(e)}
+            idx += 1
+            if idx > limit + 5:  # safety
+                break
+        except Exception:
+            break
     return results
 
 
 # ----------------------------------------------------------------------------
-# Element handle registry (avoids re-querying; handles expire after 5 min)
+# Element handle registry
 # ----------------------------------------------------------------------------
 
 _HANDLES = {}
@@ -186,7 +187,6 @@ def _get_handle(hid):
         if time.time() - ts > _HANDLE_TTL:
             del _HANDLES[hid]
             return None
-        # refresh timestamp on use
         _HANDLES[hid] = (el, time.time())
         return el
 
@@ -208,11 +208,10 @@ class Handler(BaseHTTPRequestHandler):
     token = ""
 
     def log_message(self, *args):
-        pass  # quiet
+        pass
 
     def _auth(self):
-        auth = self.headers.get("Authorization", "")
-        return auth == f"Bearer {self.token}"
+        return self.headers.get("Authorization", "") == f"Bearer {self.token}"
 
     def _send(self, code, obj=None, content_type="application/json", raw=None):
         self.send_response(code)
@@ -224,13 +223,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _body(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
-        if length:
-            return json.loads(self.rfile.read(length) or b"{}")
-        return {}
+        return json.loads(self.rfile.read(length) or b"{}") if length else {}
 
     def do_GET(self):
-        path = urlparse(self.path).path
-        if path == "/health":
+        if urlparse(self.path).path == "/health":
             self._send(200, {"ok": True, "service": "winremote-agent", "time": time.time()})
         else:
             self._send(404, {"error": "not found"})
@@ -240,88 +236,69 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth():
             self._send(401, {"error": "unauthorized"})
             return
+        _com_init()
         try:
             body = self._body()
         except Exception:
             self._send(400, {"error": "invalid json"})
             return
         try:
-            if path == "/screenshot":
-                self._handle_screenshot(body)
-            elif path == "/uia/tree":
-                self._handle_tree(body)
-            elif path == "/uia/find":
-                self._handle_find(body)
-            elif path == "/uia/invoke":
-                self._handle_invoke(body)
-            elif path == "/uia/set_value":
-                self._handle_set_value(body)
-            elif path == "/uia/focus":
-                self._handle_focus(body)
-            elif path == "/input/sendkeys":
-                self._handle_sendkeys(body)
-            elif path == "/window/activate":
-                self._handle_activate(body)
-            else:
-                self._send(404, {"error": "not found"})
+            {
+                "/screenshot": self._handle_screenshot,
+                "/uia/tree": self._handle_tree,
+                "/uia/find": self._handle_find,
+                "/uia/invoke": self._handle_invoke,
+                "/uia/set_value": self._handle_set_value,
+                "/uia/focus": self._handle_focus,
+                "/input/sendkeys": self._handle_sendkeys,
+                "/window/activate": self._handle_activate,
+            }[path](body)
+        except KeyError:
+            self._send(404, {"error": "not found"})
         except Exception as e:
-            self._send(500, {"error": str(e)})
-
-    # -- handlers --
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
     def _handle_screenshot(self, body):
         if mss is None:
             self._send(500, {"error": "mss not installed"})
             return
-        monitor = body.get("monitor", 1)
+        monitor = int(body.get("monitor", 1))
         with mss() as sct:
-            mon = sct.monitors[monitor]
+            mon = sct.monitors[monitor] if monitor < len(sct.monitors) else sct.monitors[1]
             shot = sct.grab(mon)
-            # Convert to PNG in-memory
-            from mss.tools import to_png
-            buf = io.BytesIO()
-            # to_png writes to file; do manual PNG via PIL if available, else raw
             try:
                 from PIL import Image
                 img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                buf = io.BytesIO()
                 img.save(buf, format="PNG")
+                self._send(200, raw=buf.getvalue(), content_type="image/png")
             except ImportError:
-                # Fallback: return raw BGRA + metadata as JSON
                 self._send(200, {
                     "width": shot.width, "height": shot.height,
                     "data_b64": base64.b64encode(shot.bgra).decode(),
                     "format": "bgra",
                 })
-                return
-        self._send(200, raw=buf.getvalue(), content_type="image/png")
 
     def _handle_tree(self, body):
         window = body.get("window")
         max_depth = int(body.get("max_depth", 5))
-        if window:
-            root = find_window(window)
-            if not root:
-                self._send(404, {"error": f"window not found: {window}"})
-                return
-        else:
-            root = auto.GetRootControl()
+        root = find_window(window) if window else auto.GetRootControl()
+        if not root:
+            self._send(404, {"error": f"window not found: {window}"})
+            return
         self._send(200, element_to_dict(root, max_depth=max_depth))
 
     def _handle_find(self, body):
         window = body.get("window")
-        if window:
-            root = find_window(window)
-            if not root:
-                self._send(404, {"error": f"window not found: {window}"})
-                return
-        else:
-            root = auto.GetRootControl()
+        root = find_window(window) if window else auto.GetRootControl()
+        if not root:
+            self._send(404, {"error": f"window not found: {window}"})
+            return
         results = find_elements(
             root,
-            name=body.get("name"),
+            subname=body.get("name"),
             control_type=body.get("control_type"),
             automation_id=body.get("automation_id"),
-            scope=body.get("scope", "descendants"),
             limit=int(body.get("limit", 50)),
         )
         self._send(200, {"elements": results})
@@ -331,12 +308,11 @@ class Handler(BaseHTTPRequestHandler):
         if not el:
             self._send(404, {"error": "stale or unknown handle; call /uia/find first"})
             return
-        pattern = el.GetPattern(auto.PatternId.InvokePattern)
-        if not pattern:
-            self._send(400, {"error": "element does not support invoke"})
-            return
-        pattern.Invoke()
-        self._send(200, {"ok": True})
+        try:
+            el.GetInvokePattern().Invoke()
+            self._send(200, {"ok": True})
+        except Exception as e:
+            self._send(400, {"error": f"invoke failed: {e}"})
 
     def _handle_set_value(self, body):
         el = _get_handle(body.get("handle", ""))
@@ -345,28 +321,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         value = body.get("value", "")
         try:
-            pattern = el.GetPattern(auto.PatternId.ValuePattern)
-            if not pattern:
-                self._send(400, {"error": "element does not support set_value"})
-                return
-            pattern.SetValue(value)
+            el.GetValuePattern().SetValue(value)
             self._send(200, {"ok": True, "method": "value_pattern"})
-        except Exception:
-            # Fallback: focus + clipboard paste + SendKeys
-            el.SetFocus()
-            time.sleep(0.2)
-            import subprocess
-            # Use PowerShell clipboard (same session, no cross-session issue)
-            ps = (
-                "$v = @'\n" + value.replace("'", "''") + "\n'@; "
-                "Set-Clipboard $v; "
-                "Add-Type -AssemblyName System.Windows.Forms; "
-                "[System.Windows.Forms.SendKeys]::SendWait('^v'); "
-                "Start-Sleep -m 200; Set-Clipboard ''"
-            )
-            subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                           capture_output=True, timeout=15)
-            self._send(200, {"ok": True, "method": "clipboard_paste"})
+        except Exception as e:
+            # Fallback: focus + clipboard paste
+            try:
+                el.SetFocus()
+                time.sleep(0.2)
+                import subprocess
+                safe = value.replace("'", "''")
+                ps = (f"$v = @'\n{safe}\n'@; Set-Clipboard $v; "
+                      "Add-Type -AssemblyName System.Windows.Forms; "
+                      "[System.Windows.Forms.SendKeys]::SendWait('^v'); "
+                      "Start-Sleep -m 200; Set-Clipboard ''")
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                               capture_output=True, timeout=15)
+                self._send(200, {"ok": True, "method": "clipboard_paste"})
+            except Exception as e2:
+                self._send(500, {"error": f"value_pattern: {e}; paste: {e2}"})
 
     def _handle_focus(self, body):
         el = _get_handle(body.get("handle", ""))
@@ -377,32 +349,29 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True})
 
     def _handle_sendkeys(self, body):
-        keys = body.get("keys", "")
         import subprocess
-        ps = (
-            "Add-Type -AssemblyName System.Windows.Forms; "
-            f"[System.Windows.Forms.SendKeys]::SendWait('{keys}')"
-        )
+        keys = body.get("keys", "").replace("'", "''")
+        ps = ("Add-Type -AssemblyName System.Windows.Forms; "
+              f"[System.Windows.Forms.SendKeys]::SendWait('{keys}')")
         subprocess.run(["powershell", "-NoProfile", "-Command", ps],
                        capture_output=True, timeout=15)
         self._send(200, {"ok": True})
 
     def _handle_activate(self, body):
-        window = body.get("window", "")
-        el = find_window(window)
+        el = find_window(body.get("window", ""))
         if not el:
-            self._send(404, {"error": f"window not found: {window}"})
+            self._send(404, {"error": "window not found"})
             return
         el.SetFocus()
         self._send(200, {"ok": True})
 
 
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+class ThreadedHTTPServer(__import__("socketserver").ThreadingMixIn,
+                         HTTPServer):
     daemon_threads = True
 
 
 def main():
-    global auto
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--token", default=os.environ.get("WINREMOTE_TOKEN", ""))
@@ -410,20 +379,17 @@ def main():
     args = ap.parse_args()
 
     if auto is None:
-        print("ERROR: uiautomation not installed. Run: pip install uiautomation mss")
+        print("ERROR: uiautomation not installed. Run: pip install uiautomation mss Pillow")
         raise SystemExit(1)
 
     token = args.token or secrets.token_hex(24)
     if not args.token and not os.environ.get("WINREMOTE_TOKEN"):
         print(f"Generated token: {token}")
-        print("Save it — clients must send Authorization: Bearer <token>")
 
     Handler.token = token
-    # Only accept connections from localhost + Tailscale interface for safety.
-    # (Tailscale ACLs already restrict; this is defense in depth.)
     server = ThreadedHTTPServer((args.host, args.port), Handler)
     threading.Thread(target=_prune_handles, daemon=True).start()
-    print(f"winremote-agent listening on {args.host}:{args.port}")
+    print(f"winremote-agent listening on {args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
