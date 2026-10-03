@@ -263,15 +263,46 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": "mss not installed"})
             return
         monitor = int(body.get("monitor", 1))
+        window = body.get("window")  # optional: crop to this window's rect
+        fmt = body.get("format", "png").lower()  # png or jpeg
+        quality = int(body.get("quality", 75))  # jpeg quality 1-100
+        scale = float(body.get("scale", 1.0))  # downscale factor
+
+        # Determine crop rect
+        crop = None
+        if window:
+            win = find_window(window)
+            if win:
+                try:
+                    r = win.BoundingRectangle
+                    crop = (r.left, r.top, r.width(), r.height())
+                except Exception:
+                    pass
+
         with mss() as sct:
             mon = sct.monitors[monitor] if monitor < len(sct.monitors) else sct.monitors[1]
             shot = sct.grab(mon)
             try:
                 from PIL import Image
                 img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                # Crop to window if requested (adjust for monitor offset)
+                if crop:
+                    x, y, w, h = crop
+                    # mss coordinates are relative to the monitor
+                    mx, my = mon["left"], mon["top"]
+                    img = img.crop((x - mx, y - my, x - mx + w, y - my + h))
+                # Downscale if requested
+                if scale < 1.0:
+                    nw, nh = int(img.width * scale), int(img.height * scale)
+                    img = img.resize((nw, nh), Image.LANCZOS)
                 buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                self._send(200, raw=buf.getvalue(), content_type="image/png")
+                if fmt == "jpeg":
+                    img.save(buf, format="JPEG", quality=quality, optimize=True)
+                    ctype = "image/jpeg"
+                else:
+                    img.save(buf, format="PNG", optimize=True)
+                    ctype = "image/png"
+                self._send(200, raw=buf.getvalue(), content_type=ctype)
             except ImportError:
                 self._send(200, {
                     "width": shot.width, "height": shot.height,
