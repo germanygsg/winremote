@@ -88,6 +88,15 @@ class WinRemote:
         """Set text on an edit control. Works on WebView2 inputs via ValuePattern."""
         return self._req("POST", "/uia/set_value", {"handle": handle, "value": value})
 
+    def set_value_at(self, x, y, value):
+        """Set text on element at screen coordinates via ValuePattern.
+        Bypasses find — uses UIA FromPoint directly."""
+        return self._req("POST", "/uia/set_value_at", {"x": x, "y": y, "value": value})
+
+    def paste_text(self, text):
+        """Paste text at current focus via clipboard. Click to focus first."""
+        return self._req("POST", "/input/paste_text", {"text": text})
+
     def expand(self, handle, action="expand"):
         """Expand/collapse a dropdown via ExpandCollapsePattern.
         action: "expand"|"collapse"|"toggle"."""

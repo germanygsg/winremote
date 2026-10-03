@@ -249,6 +249,8 @@ class Handler(BaseHTTPRequestHandler):
                 "/uia/find": self._handle_find,
                 "/uia/invoke": self._handle_invoke,
                 "/uia/set_value": self._handle_set_value,
+                "/uia/set_value_at": self._handle_set_value_at,
+                "/input/paste_text": self._handle_paste_text,
                 "/uia/expand": self._handle_expand,
                 "/uia/select": self._handle_select,
                 "/uia/focus": self._handle_focus,
@@ -385,6 +387,80 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True})
         except Exception as e:
             self._send(400, {"error": f"select failed: {e}"})
+
+    def _handle_set_value_at(self, body):
+        """Set text on the element at screen coordinates via ValuePattern.
+        Bypasses /uia/find — uses UIA FromPoint to get the element directly.
+        Body: {x, y, value}"""
+        x = body.get("x")
+        y = body.get("y")
+        value = body.get("value", "")
+        if x is None or y is None:
+            self._send(400, {"error": "x and y required"})
+            return
+        try:
+            _com_init()
+            el = auto.ControlFromPoint(x, y)
+            if not el or not el.Exists(0.5, 0.1):
+                self._send(404, {"error": f"no element at {x},{y}"})
+                return
+            # Try ValuePattern first
+            try:
+                el.GetValuePattern().SetValue(value)
+                self._send(200, {"ok": True, "method": "value_pattern", "name": el.Name})
+                return
+            except Exception as e1:
+                # Fallback: focus + select all + clipboard paste
+                try:
+                    el.SetFocus()
+                    time.sleep(0.3)
+                    # Select all existing text
+                    el.GetTextPattern().GetSelection().GetElement(0) if False else None
+                except Exception:
+                    pass
+                import subprocess
+                # Escape for PowerShell here-string
+                safe = value.replace("'", "''")
+                ps = (f"$v = @'\n{safe}\n'@; Set-Clipboard $v; "
+                      "Add-Type -AssemblyName System.Windows.Forms; "
+                      "[System.Windows.Forms.SendKeys]::SendWait('^a'); "
+                      "Start-Sleep -m 100; "
+                      "[System.Windows.Forms.SendKeys]::SendWait('^v'); "
+                      "Start-Sleep -m 200")
+                subprocess.run(
+                    [r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                     "-NoProfile", "-Command", ps],
+                    capture_output=True, timeout=15)
+                self._send(200, {"ok": True, "method": "clipboard_paste", "name": el.Name})
+        except Exception as e:
+            self._send(500, {"error": f"set_value_at failed: {e}"})
+
+    def _handle_paste_text(self, body):
+        """Paste text at current focus via clipboard. No UIA needed.
+        Caller must click to focus the target field first (real click).
+        Body: {text}"""
+        text = body.get("text", "")
+        if not text:
+            self._send(400, {"error": "text required"})
+            return
+        try:
+            import subprocess
+            safe = text.replace("'", "''")
+            # Set clipboard, then Ctrl+A (select all), Ctrl+V (paste)
+            ps = (f"$v = @'\n{safe}\n'@; Set-Clipboard $v; "
+                  "Add-Type -AssemblyName System.Windows.Forms; "
+                  "[System.Windows.Forms.SendKeys]::SendWait('^a'); "
+                  "Start-Sleep -m 150; "
+                  "[System.Windows.Forms.SendKeys]::SendWait('^v'); "
+                  "Start-Sleep -m 300; "
+                  "Set-Clipboard ''")
+            subprocess.run(
+                [r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                 "-NoProfile", "-Command", ps],
+                capture_output=True, timeout=15)
+            self._send(200, {"ok": True, "method": "paste_text"})
+        except Exception as e:
+            self._send(500, {"error": f"paste_text failed: {e}"})
 
     def _handle_set_value(self, body):
         el = _get_handle(body.get("handle", ""))
