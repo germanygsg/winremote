@@ -1156,8 +1156,19 @@ class Handler(BaseHTTPRequestHandler):
         # Read text from the Windows clipboard.
         # Returns {ok, text} or {ok, text: None} if no text available.
         import ctypes
+        from ctypes import wintypes
         u = ctypes.windll.user32
         k = ctypes.windll.kernel32
+        u.OpenClipboard.argtypes = [wintypes.HWND]
+        u.OpenClipboard.restype = wintypes.BOOL
+        u.GetClipboardData.argtypes = [wintypes.UINT]
+        u.GetClipboardData.restype = wintypes.HANDLE
+        u.CloseClipboard.argtypes = []
+        u.CloseClipboard.restype = wintypes.BOOL
+        k.GlobalLock.argtypes = [wintypes.HANDLE]
+        k.GlobalLock.restype = wintypes.LPVOID
+        k.GlobalUnlock.argtypes = [wintypes.HANDLE]
+        k.GlobalUnlock.restype = wintypes.BOOL
         text = None
         try:
             if u.OpenClipboard(None):
@@ -1181,12 +1192,29 @@ class Handler(BaseHTTPRequestHandler):
         # Write text to the Windows clipboard.
         # body: {text}. Returns {ok}.
         import ctypes
+        from ctypes import wintypes
         text = body.get("text", "")
         if not isinstance(text, str):
             self._send(400, {"error": "text must be a string"})
             return
         u = ctypes.windll.user32
         k = ctypes.windll.kernel32
+        u.OpenClipboard.argtypes = [wintypes.HWND]
+        u.OpenClipboard.restype = wintypes.BOOL
+        u.EmptyClipboard.argtypes = []
+        u.EmptyClipboard.restype = wintypes.BOOL
+        u.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        u.SetClipboardData.restype = wintypes.HANDLE
+        u.CloseClipboard.argtypes = []
+        u.CloseClipboard.restype = wintypes.BOOL
+        k.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        k.GlobalAlloc.restype = wintypes.HANDLE
+        k.GlobalLock.argtypes = [wintypes.HANDLE]
+        k.GlobalLock.restype = wintypes.LPVOID
+        k.GlobalUnlock.argtypes = [wintypes.HANDLE]
+        k.GlobalUnlock.restype = wintypes.BOOL
+        k.GlobalFree.argtypes = [wintypes.HANDLE]
+        k.GlobalFree.restype = wintypes.HANDLE
         ok = False
         try:
             if u.OpenClipboard(None):
