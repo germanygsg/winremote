@@ -335,6 +335,7 @@ def _restart_into_new():
     """
     # NOTE: no shutdown()/server_close() here — see docstring. Straight
     # to spawn + exit.
+    # 2026-10-09: final restart path proven live via production self-update.
     time.sleep(1)
     agent_dir = os.path.dirname(_agent_path())
     DETACHED_PROCESS = 0x00000008
