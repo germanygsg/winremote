@@ -538,19 +538,35 @@ class Handler(BaseHTTPRequestHandler):
             from ctypes import wintypes
 
             # INPUT structure for SendInput
+            # NOTE: INPUT's union member must be sized to the largest variant
+            # (MOUSEINPUT, 32 bytes on 64-bit). A bare KEYBDINPUT (24 bytes)
+            # makes cbSize wrong and SendInput() rejects the whole call with 0.
+            class MOUSEINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("dx", wintypes.LONG),
+                    ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_void_p),
+                ]
+
             class KEYBDINPUT(ctypes.Structure):
                 _fields_ = [
                     ("wVk", wintypes.WORD),
                     ("wScan", wintypes.WORD),
                     ("dwFlags", wintypes.DWORD),
                     ("time", wintypes.DWORD),
-                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+                    ("dwExtraInfo", ctypes.c_void_p),
                 ]
+
+            class _INPUT_UNION(ctypes.Union):
+                _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
 
             class INPUT(ctypes.Structure):
                 _fields_ = [
                     ("type", wintypes.DWORD),
-                    ("ki", KEYBDINPUT),
+                    ("u", _INPUT_UNION),
                 ]
 
             INPUT_KEYBOARD = 1
@@ -609,19 +625,35 @@ class Handler(BaseHTTPRequestHandler):
                 'ctrl_v': (0x11, 0x56),  # Ctrl+V
             }
 
+            # NOTE: INPUT's union member must be sized to the largest variant
+            # (MOUSEINPUT, 32 bytes on 64-bit). A bare KEYBDINPUT (24 bytes)
+            # makes cbSize wrong and SendInput() rejects the whole call with 0.
+            class MOUSEINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("dx", wintypes.LONG),
+                    ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_void_p),
+                ]
+
             class KEYBDINPUT(ctypes.Structure):
                 _fields_ = [
                     ("wVk", wintypes.WORD),
                     ("wScan", wintypes.WORD),
                     ("dwFlags", wintypes.DWORD),
                     ("time", wintypes.DWORD),
-                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+                    ("dwExtraInfo", ctypes.c_void_p),
                 ]
+
+            class _INPUT_UNION(ctypes.Union):
+                _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
 
             class INPUT(ctypes.Structure):
                 _fields_ = [
                     ("type", wintypes.DWORD),
-                    ("ki", KEYBDINPUT),
+                    ("u", _INPUT_UNION),
                 ]
 
             INPUT_KEYBOARD = 1
