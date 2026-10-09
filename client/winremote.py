@@ -13,6 +13,9 @@ Usage:
 """
 
 import json
+import os
+import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -170,6 +173,87 @@ class WinRemote:
 
     def activate(self, window):
         return self._req("POST", "/window/activate", {"window": window})
+
+    # -- file transfer --
+
+    def _req_raw(self, method, path, data=None, headers=None):
+        """Raw-byte request. Returns (status, body_bytes, headers_dict)."""
+        url = self.base + path
+        h = {"Authorization": f"Bearer {self.token}"}
+        if headers:
+            h.update(headers)
+        req = urllib.request.Request(url, data=data, method=method, headers=h)
+        try:
+            with self.opener.open(req, timeout=self.timeout) as resp:
+                return resp.status, resp.read(), dict(resp.headers)
+        except urllib.error.HTTPError as e:
+            try:
+                detail = json.loads(e.read() or b"{}")
+            except Exception:
+                detail = {}
+            raise WinRemoteError(f"HTTP {e.code}: {detail.get('error', e.reason)}")
+        except Exception as e:
+            raise WinRemoteError(str(e))
+
+    def file_info(self, remote_path):
+        """{'size', 'mtime', 'is_dir'} for a file on the Windows machine."""
+        return self._req("GET", "/file/info?path=" +
+                         urllib.parse.quote(remote_path, safe=""))
+
+    def upload(self, local_path, remote_path, chunk_size=1024 * 1024):
+        """Upload a local file to the Windows machine, chunked + resumable.
+
+        If the remote file already exists, the transfer resumes from its
+        current size (the common case after a dropped Tailscale connection).
+        """
+        size = os.path.getsize(local_path)
+        try:
+            offset = self.file_info(remote_path).get("size", 0)
+        except WinRemoteError:
+            offset = 0
+        if offset > size:
+            offset = 0  # remote is bigger than local: start over
+        with open(local_path, "rb") as f:
+            f.seek(offset)
+            while offset < size:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                status, body, _ = self._req_raw(
+                    "POST", "/file/upload", data=chunk, headers={
+                        "Content-Type": "application/octet-stream",
+                        "X-File-Path": urllib.parse.quote(remote_path, safe=""),
+                        "X-File-Offset": str(offset),
+                        "X-File-Size": str(size),
+                    })
+                if status != 200:
+                    raise WinRemoteError(f"upload failed at offset {offset}: HTTP {status}")
+                resp = json.loads(body or b"{}")
+                offset = resp.get("bytes_written", offset + len(chunk))
+        return {"ok": True, "path": remote_path, "bytes_written": offset}
+
+    def download(self, remote_path, local_path, chunk_size=1024 * 1024):
+        """Download a file from the Windows machine, chunked + resumable.
+
+        If local_path already exists, the transfer resumes from its current
+        size instead of starting over.
+        """
+        total = self.file_info(remote_path)["size"]
+        offset = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+        if offset > total:
+            offset = 0
+        with open(local_path, "r+b" if offset else "wb") as f:
+            f.seek(offset)
+            while offset < total:
+                length = min(chunk_size, total - offset)
+                status, data, _ = self._req_raw(
+                    "GET", "/file/download?path=%s&offset=%d&length=%d" % (
+                        urllib.parse.quote(remote_path, safe=""), offset, length))
+                if status != 200 or not data:
+                    raise WinRemoteError(f"download failed at offset {offset}: HTTP {status}")
+                f.write(data)
+                offset += len(data)
+        return local_path
 
     # -- convenience --
 

@@ -6,6 +6,9 @@ Runs on the Windows machine in the interactive session. Exposes an HTTP API
 for fast UIA-based GUI automation: screenshots, element trees, clicks,
 text input (including WebView2 via ValuePattern), and keyboard input.
 
+Also carries chunked file transfers (GET /file/info, GET /file/download,
+POST /file/upload): raw bytes, ranged and resumable in both directions.
+
 No per-operation scheduled tasks. No file polling. Sub-second latency.
 
 Usage:
@@ -25,7 +28,27 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, unquote
+
+# Max bytes per file-transfer chunk. Transfers stream in 1 MiB chunks so both
+# sides keep constant memory; 8 MiB is a hard cap per request to bound RAM.
+_DEFAULT_CHUNK = 1024 * 1024
+_MAX_CHUNK = 8 * 1024 * 1024
+
+
+def _resolve_path(raw):
+    """Validate an absolute Windows path and return its normalized form.
+
+    Transfers require absolute paths so the client is always explicit about
+    where bytes land. The agent runs elevated: this check prevents accidental
+    relative-path writes, not malicious ones — the Bearer <redacted> is the gate.
+    """
+    if not raw:
+        raise ValueError("path required")
+    path = unquote(raw)
+    if not os.path.isabs(path):
+        raise ValueError("path must be absolute")
+    return os.path.normpath(path)
 
 try:
     import uiautomation as auto
@@ -226,10 +249,24 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length) or b"{}") if length else {}
 
     def do_GET(self):
-        if urlparse(self.path).path == "/health":
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/health":
             self._send(200, {"ok": True, "service": "winremote-agent", "time": time.time()})
-        else:
-            self._send(404, {"error": "not found"})
+            return
+        if not self._auth():
+            self._send(401, {"error": "unauthorized"})
+            return
+        try:
+            query = parse_qs(parsed.query)
+            if path == "/file/info":
+                self._handle_file_info(query)
+            elif path == "/file/download":
+                self._handle_file_download(query)
+            else:
+                self._send(404, {"error": "not found"})
+        except Exception as e:
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -237,6 +274,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401, {"error": "unauthorized"})
             return
         _com_init()
+        if path == "/file/upload":
+            # Raw-byte upload (not JSON): body is one chunk, target path and
+            # offset travel in headers. Kept separate so large transfers never
+            # pass through the JSON body parser.
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if length > _MAX_CHUNK:
+                    self._send(413, {"error": f"chunk too large (max {_MAX_CHUNK} bytes)"})
+                    return
+                self._handle_file_upload(self.rfile.read(length))
+            except Exception as e:
+                self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            return
         try:
             body = self._body()
         except Exception:
@@ -779,6 +829,74 @@ class Handler(BaseHTTPRequestHandler):
             return
         el.SetFocus()
         self._send(200, {"ok": True})
+
+    # ------------------------------------------------------------------
+    # File transfer: GET /file/info, GET /file/download, POST /file/upload
+    #
+    # Transfers are chunked and ranged in both directions. Chunks are raw
+    # bytes (no base64): downloads come back as application/octet-stream,
+    # uploads arrive as the POST body with X-File-Path / X-File-Offset /
+    # X-File-Size headers. Clients resume a dropped transfer by asking
+    # /file/info for the remote size and continuing from that offset.
+    # No delete/rename endpoint by design.
+    # ------------------------------------------------------------------
+
+    def _handle_file_info(self, query):
+        path = _resolve_path(query.get("path", [""])[0])
+        if not os.path.exists(path):
+            self._send(404, {"error": "not found"})
+            return
+        st = os.stat(path)
+        self._send(200, {"ok": True, "path": path, "size": st.st_size,
+                         "mtime": st.st_mtime, "is_dir": os.path.isdir(path)})
+
+    def _handle_file_download(self, query):
+        path = _resolve_path(query.get("path", [""])[0])
+        offset = int(query.get("offset", ["0"])[0] or 0)
+        length = int(query.get("length", [str(_DEFAULT_CHUNK)])[0] or _DEFAULT_CHUNK)
+        if length > _MAX_CHUNK:
+            self._send(413, {"error": f"chunk too large (max {_MAX_CHUNK} bytes)"})
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            self._send(404, {"error": "not found"})
+            return
+        if offset < 0 or offset > size:
+            self._send(416, {"error": "offset out of range"})
+            return
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read(length)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Total-Size", str(size))
+        self.send_header("X-Chunk-Offset", str(offset))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_file_upload(self, data):
+        path = _resolve_path(self.headers.get("X-File-Path", ""))
+        offset = int(self.headers.get("X-File-Offset", "0") or 0)
+        total = self.headers.get("X-File-Size")
+        total = int(total) if total else None
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        existing = os.path.getsize(path) if os.path.exists(path) else 0
+        if offset > existing:
+            # Refuse to create sparse holes: the client must resume from the
+            # real end of the remote file, not past it.
+            self._send(409, {"error": f"offset {offset} beyond end of file ({existing}); resume from {existing}"})
+            return
+        mode = "r+b" if os.path.exists(path) else "wb"
+        with open(path, mode) as f:
+            f.seek(offset)
+            f.write(data)
+        written = offset + len(data)
+        self._send(200, {"ok": True, "path": path, "bytes_written": written,
+                         "complete": total is not None and written >= total})
 
 
 class ThreadedHTTPServer(__import__("socketserver").ThreadingMixIn,

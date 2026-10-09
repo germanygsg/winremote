@@ -70,6 +70,14 @@ agent.sendkeys("{ENTER}")
 | POST | `/uia/focus` | Focus element. Body: `{"handle"}` |
 | POST | `/input/sendkeys` | SendKeys. Body: `{"keys": "{ENTER}"}` |
 | POST | `/window/activate` | Bring window forward. Body: `{"window": "Name"}` |
+| GET | `/file/info?path=...` | File metadata: `{"size", "mtime", "is_dir"}` |
+| GET | `/file/download?path=...&offset=0&length=1048576` | Raw bytes chunk of a file (ranged, resumable) |
+| POST | `/file/upload` | Raw bytes chunk in body; headers `X-File-Path`, `X-File-Offset`, `X-File-Size` |
+
+File transfers are chunked (1 MiB default, 8 MiB max per request) and
+resumable: the client asks `/file/info` for the remote size and continues
+from that offset, so a dropped connection restarts mid-file, not from zero.
+Paths must be absolute. There is no delete/rename endpoint by design.
 
 Element `handle`s expire after 5 minutes of disuse — call `/uia/find` again.
 
