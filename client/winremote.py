@@ -181,6 +181,20 @@ class WinRemote:
         """List running processes, optionally filtered by name substring."""
         return self._req("POST", "/proc/list", {"name": name})
 
+    def shell_exec(self, command, timeout=30):
+        """Run a PowerShell command on H410M. Returns {stdout, stderr, exit_code}."""
+        return self._req("POST", "/shell/exec",
+                         {"command": command, "timeout": timeout})
+
+    def registry_get(self, path):
+        """Read a registry value or key. Path like 'HKLM:\\SOFTWARE\\...'."""
+        return self._req("POST", "/registry/get", {"path": path})
+
+    def registry_set(self, path, value, type="REG_SZ"):
+        """Write a registry value. USE WITH CARE."""
+        return self._req("POST", "/registry/set",
+                         {"path": path, "value": value, "type": type})
+
     def sendkeys(self, keys):
         """SendKeys string, e.g. '{ENTER}', '^v' (Ctrl+V)."""
         return self._req("POST", "/input/sendkeys", {"keys": keys})

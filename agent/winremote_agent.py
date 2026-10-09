@@ -511,6 +511,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/update/check": self._handle_update_check,
                 "/proc/start": self._handle_proc_start,
                 "/proc/list": self._handle_proc_list,
+                "/shell/exec": self._handle_shell_exec,
+                "/registry/get": self._handle_registry_get,
+                "/registry/set": self._handle_registry_set,
             }[path](body)
         except KeyError:
             self._send(404, {"error": "not found"})
@@ -1126,6 +1129,100 @@ class Handler(BaseHTTPRequestHandler):
                     except ValueError:
                         pass
         self._send(200, {"ok": True, "processes": procs})
+
+    def _handle_shell_exec(self, body):
+        """Run a PowerShell command, capture output.
+        body: {command, timeout=30}. Returns {ok, stdout, stderr, exit_code}."""
+        import subprocess
+        cmd = body.get("command", "")
+        if not cmd:
+            self._send(400, {"error": "command is required"})
+            return
+        timeout = min(int(body.get("timeout", 30)), 120)
+        try:
+            proc = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-Command", cmd],
+                capture_output=True, text=True, timeout=timeout,
+                cwd=os.path.expanduser("~"))
+            self._send(200, {"ok": True, "stdout": proc.stdout,
+                             "stderr": proc.stderr,
+                             "exit_code": proc.returncode})
+        except subprocess.TimeoutExpired:
+            self._send(500, {"error": "command timed out"})
+        except Exception as e:
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
+
+    def _handle_registry_get(self, body):
+        """Read a registry value. body: {path} like
+        'HKLM:\\SOFTWARE\\...'. Returns {ok, value} or {ok, values:{...}}
+        for a key."""
+        import winreg
+        path = body.get("path", "")
+        if not path:
+            self._send(400, {"error": "path is required"})
+            return
+        try:
+            hive_name, _, rest = path.partition("\\")
+            hive = {"HKLM": winreg.HKEY_LOCAL_MACHINE,
+                    "HKCU": winreg.HKEY_CURRENT_USER,
+                    "HKCR": winreg.HKEY_CLASSES_ROOT,
+                    "HKU": winreg.HKEY_USERS}.get(hive_name.upper())
+            if hive is None:
+                self._send(400, {"error": "unknown hive"})
+                return
+            # Split key path and value name
+            if "\\" in rest:
+                key_path, _, value_name = rest.rpartition("\\")
+            else:
+                key_path, value_name = rest, ""
+            with winreg.OpenKey(hive, key_path) as key:
+                if value_name:
+                    val, typ = winreg.QueryValueEx(key, value_name)
+                    self._send(200, {"ok": True, "value": val, "type": typ})
+                else:
+                    values = {}
+                    for i in range(winreg.QueryInfoKey(key)[1]):
+                        n, v, t = winreg.EnumValue(key, i)
+                        values[n] = v
+                    self._send(200, {"ok": True, "values": values})
+        except FileNotFoundError:
+            self._send(404, {"error": "not found"})
+        except Exception as e:
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
+
+    def _handle_registry_set(self, body):
+        """Write a registry value. body: {path, value, type='REG_SZ'}.
+        Creates intermediate keys. USE WITH CARE."""
+        import winreg
+        path = body.get("path", "")
+        value = body.get("value")
+        if not path:
+            self._send(400, {"error": "path is required"})
+            return
+        type_map = {"REG_SZ": winreg.REG_SZ, "REG_DWORD": winreg.REG_DWORD,
+                    "REG_QWORD": winreg.REG_QWORD,
+                    "REG_BINARY": winreg.REG_BINARY,
+                    "REG_MULTI_SZ": winreg.REG_MULTI_SZ,
+                    "REG_EXPAND_SZ": winreg.REG_EXPAND_SZ}
+        vtype = type_map.get(body.get("type", "REG_SZ"), winreg.REG_SZ)
+        try:
+            hive_name, _, rest = path.partition("\\")
+            hive = {"HKLM": winreg.HKEY_LOCAL_MACHINE,
+                    "HKCU": winreg.HKEY_CURRENT_USER,
+                    "HKCR": winreg.HKEY_CLASSES_ROOT}.get(hive_name.upper())
+            if hive is None:
+                self._send(400, {"error": "unknown hive"})
+                return
+            key_path, _, value_name = rest.rpartition("\\")
+            if not value_name:
+                self._send(400, {"error": "path must include a value name"})
+                return
+            with winreg.CreateKey(hive, key_path) as key:
+                winreg.SetValueEx(key, value_name, 0, vtype, value)
+            self._send(200, {"ok": True})
+        except Exception as e:
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
     def _handle_activate(self, body):
         el = find_window(body.get("window", ""))
