@@ -209,7 +209,7 @@ class WinRemote:
 
     def session_list(self):
         """List active shell sessions."""
-        return self._req("GET", "/shell/session/list")
+        return self._req("POST", "/shell/session/list", {})
 
     def forward_add(self, target_port, target_host="127.0.0.1",
                     listen_port=0):
@@ -228,7 +228,7 @@ class WinRemote:
 
     def forward_list(self):
         """List active TCP port forwards."""
-        return self._req("GET", "/net/forward/list")
+        return self._req("POST", "/net/forward/list", {})
 
     def registry_get(self, path):
         """Read a registry value or key. Path like 'HKLM:\\SOFTWARE\\...'."""
