@@ -473,6 +473,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_file_list(query)
             elif path == "/file/download":
                 self._handle_file_download(query)
+            elif path == "/shell/session/list":
+                self._handle_session_list({})
+            elif path == "/net/forward/list":
+                self._handle_forward_list({})
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:
