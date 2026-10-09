@@ -12,7 +12,7 @@ in both directions.
 
 Self-updating: every --update-interval seconds (default 600) the agent
 compares its own file hash against the latest on GitHub main; on change
-it canary-tests the new version on port 8766 and re-execs into it, but
+it canary-tests the new version on port 8766 and restarts into it, but
 only after --update-idle seconds (default 180) with no incoming requests
 — never mid-work. Disable with --no-auto-update or WINREMOTE_AUTO_UPDATE=0.
 
@@ -31,6 +31,7 @@ import io
 import json
 import os
 import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -308,13 +309,42 @@ def _apply_update(tmp):
 
 
 def _restart_into_new():
+    """Restart the agent into the just-installed new file.
+
+    NOTE (2026-10-09, proven on H410M — do NOT "simplify" back to os.execv):
+    os.execv(sys.executable, ...) into python.exe silently TERMINATES the
+    process on this box (Python 3.14, Windows): no exception, no replacement
+    image, the process just vanishes. Verified in 4 trials — main thread,
+    Timer thread, plain thread, and with server.shutdown() — while
+    os.execv into cmd.exe works fine. So the restart spawns a detached child
+    and exits instead of exec'ing.
+    """
     if _server is not None:
         try:
             _server.shutdown()
         except Exception:
             pass
+        try:
+            _server.server_close()  # free the port BEFORE the child binds it
+        except Exception:
+            pass
     time.sleep(1)
-    os.execv(sys.executable, [sys.executable, _agent_path()] + sys.argv[1:])
+    agent_dir = os.path.dirname(_agent_path())
+    DETACHED_PROCESS = 0x00000008
+    try:
+        subprocess.Popen(
+            [sys.executable, _agent_path()] + sys.argv[1:],
+            cwd=agent_dir,
+            env=dict(os.environ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=DETACHED_PROCESS,
+            close_fds=False,
+        )
+    except Exception:
+        pass
+    os._exit(0)
 
 
 def update_now(force=False):
@@ -324,7 +354,7 @@ def update_now(force=False):
     been idle (no requests for idle_seconds) — never in the middle of
     someone's work. Never restarts directly: the caller schedules
     _restart_into_new() after responding, so /update/check can answer
-    before the exec."""
+    before the restart."""
     if not _update_lock.acquire(blocking=False):
         return False, "update already in progress"
     try:
