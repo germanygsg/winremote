@@ -30,11 +30,14 @@ import base64
 import io
 import json
 import os
+import queue
 import secrets
+import socket
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs, unquote
@@ -43,6 +46,18 @@ from urllib.parse import urlparse, parse_qs, unquote
 # sides keep constant memory; 8 MiB is a hard cap per request to bound RAM.
 _DEFAULT_CHUNK = 1024 * 1024
 _MAX_CHUNK = 8 * 1024 * 1024
+
+# Persistent shell sessions: session_id -> {"proc", "queue", "lock", "bitness", "reader"}
+_shell_sessions = {}
+_shell_sessions_lock = threading.Lock()
+
+# TCP port forwards: forward_id -> {"stop", "thread", "listen_port", "target"}
+_port_forwards = {}
+_port_forwards_lock = threading.Lock()
+
+# PowerShell paths by bitness
+_PS64 = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+_PS32 = r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
 
 
 def _resolve_path(raw):
@@ -512,6 +527,13 @@ class Handler(BaseHTTPRequestHandler):
                 "/proc/start": self._handle_proc_start,
                 "/proc/list": self._handle_proc_list,
                 "/shell/exec": self._handle_shell_exec,
+                "/shell/session/create": self._handle_session_create,
+                "/shell/session/exec": self._handle_session_exec,
+                "/shell/session/close": self._handle_session_close,
+                "/shell/session/list": self._handle_session_list,
+                "/net/forward/add": self._handle_forward_add,
+                "/net/forward/remove": self._handle_forward_remove,
+                "/net/forward/list": self._handle_forward_list,
                 "/registry/get": self._handle_registry_get,
                 "/registry/set": self._handle_registry_set,
             }[path](body)
@@ -1132,14 +1154,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_shell_exec(self, body):
         """Run a PowerShell command, capture output.
-        body: {command, timeout=30}. Returns {ok, stdout, stderr, exit_code}."""
+        body: {command, timeout=30, bitness="64"|"32"}.
+        Returns {ok, stdout, stderr, exit_code}."""
         import subprocess
         cmd = body.get("command", "")
         if not cmd:
             self._send(400, {"error": "command is required"})
             return
         timeout = min(int(body.get("timeout", 30)), 120)
-        ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        bitness = str(body.get("bitness", "64"))
+        ps = _PS32 if bitness == "32" else _PS64
         try:
             proc = subprocess.run(
                 [ps, "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -1148,11 +1172,240 @@ class Handler(BaseHTTPRequestHandler):
                 cwd=os.path.expanduser("~"))
             self._send(200, {"ok": True, "stdout": proc.stdout,
                              "stderr": proc.stderr,
-                             "exit_code": proc.returncode})
+                             "exit_code": proc.returncode,
+                             "bitness": bitness})
         except subprocess.TimeoutExpired:
             self._send(500, {"error": "command timed out"})
         except Exception as e:
             self._send(500, {"error": f"{type(e).__name__}: {e}"})
+
+    def _handle_session_create(self, body):
+        """Create a persistent PowerShell session.
+        body: {bitness="64"|"32"}. Returns {ok, session_id}.
+        The session keeps cwd, env vars, and functions across exec calls,
+        like an SSH session."""
+        import subprocess
+        bitness = str(body.get("bitness", "64"))
+        ps = _PS32 if bitness == "32" else _PS64
+        try:
+            proc = subprocess.Popen(
+                [ps, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-Command", "-"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                cwd=os.path.expanduser("~"))
+        except Exception as e:
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            return
+        sid = uuid.uuid4().hex[:12]
+        q = queue.Queue()
+        lock = threading.Lock()
+
+        def _reader():
+            try:
+                for line in proc.stdout:
+                    q.put(line)
+            except Exception:
+                pass
+            finally:
+                q.put(None)  # sentinel: process ended
+
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        with _shell_sessions_lock:
+            _shell_sessions[sid] = {
+                "proc": proc, "queue": q, "lock": lock,
+                "bitness": bitness, "reader": t,
+                "created": time.time(),
+            }
+        self._send(200, {"ok": True, "session_id": sid,
+                         "bitness": bitness})
+
+    def _handle_session_exec(self, body):
+        """Run a command in a persistent session.
+        body: {session_id, command, timeout=30}.
+        Returns {ok, stdout, exit_code}."""
+        sid = body.get("session_id", "")
+        cmd = body.get("command", "")
+        if not sid or not cmd:
+            self._send(400, {"error": "session_id and command required"})
+            return
+        timeout = min(int(body.get("timeout", 30)), 120)
+        with _shell_sessions_lock:
+            sess = _shell_sessions.get(sid)
+        if not sess:
+            self._send(404, {"error": "session not found"})
+            return
+        marker = f"__WR_END_{uuid.uuid4().hex[:8]}__"
+        with sess["lock"]:
+            proc = sess["proc"]
+            q = sess["queue"]
+            if proc.poll() is not None:
+                self._send(500, {"error": "session process has exited"})
+                return
+            try:
+                proc.stdin.write(f"{cmd}\n")
+                proc.stdin.write(f'echo "{marker}:$LASTEXITCODE"\n')
+                proc.stdin.flush()
+            except Exception as e:
+                self._send(500, {"error": f"write failed: {e}"})
+                return
+            out_lines = []
+            exit_code = None
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                remaining = deadline - time.time()
+                try:
+                    line = q.get(timeout=max(0.1, remaining))
+                except queue.Empty:
+                    break
+                if line is None:
+                    self._send(500, {"error": "session process ended"})
+                    return
+                if marker in line:
+                    try:
+                        exit_code = int(
+                            line.split(":")[-1].strip().strip('"'))
+                    except Exception:
+                        exit_code = 0
+                    break
+                out_lines.append(line)
+            self._send(200, {"ok": True,
+                             "stdout": "".join(out_lines),
+                             "exit_code": exit_code})
+
+    def _handle_session_close(self, body):
+        """Close a persistent session. body: {session_id}."""
+        sid = body.get("session_id", "")
+        with _shell_sessions_lock:
+            sess = _shell_sessions.pop(sid, None)
+        if not sess:
+            self._send(404, {"error": "session not found"})
+            return
+        try:
+            sess["proc"].terminate()
+        except Exception:
+            pass
+        self._send(200, {"ok": True})
+
+    def _handle_session_list(self, body):
+        """List active shell sessions."""
+        with _shell_sessions_lock:
+            sessions = [
+                {"session_id": sid,
+                 "bitness": s["bitness"],
+                 "alive": s["proc"].poll() is None,
+                 "created": s["created"]}
+                for sid, s in _shell_sessions.items()
+            ]
+        self._send(200, {"ok": True, "sessions": sessions})
+
+    def _handle_forward_add(self, body):
+        """Create a TCP port forward (SSH -L equivalent).
+        Listens on 0.0.0.0:listen_port on this machine and forwards
+        to target_host:target_port.
+        body: {listen_port (0=auto), target_host="127.0.0.1",
+               target_port}. Returns {ok, forward_id, listen_port}."""
+        try:
+            listen_port = int(body.get("listen_port", 0))
+            target_host = body.get("target_host", "127.0.0.1")
+            target_port = int(body.get("target_port", 0))
+        except (TypeError, ValueError):
+            self._send(400, {"error": "invalid ports"})
+            return
+        if not target_port:
+            self._send(400, {"error": "target_port required"})
+            return
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("0.0.0.0", listen_port))
+            srv.listen(20)
+        except Exception as e:
+            self._send(500, {"error": f"bind failed: {e}"})
+            return
+        actual_port = srv.getsockname()[1]
+        stop = threading.Event()
+        fid = uuid.uuid4().hex[:12]
+
+        def _relay(src, dst):
+            try:
+                while not stop.is_set():
+                    data = src.recv(65536)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except Exception:
+                pass
+            finally:
+                for s in (src, dst):
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+        def _accept_loop():
+            srv.settimeout(1.0)
+            while not stop.is_set():
+                try:
+                    client, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+                try:
+                    target = socket.create_connection(
+                        (target_host, target_port), timeout=10)
+                except Exception:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    continue
+                threading.Thread(target=_relay, args=(client, target),
+                                 daemon=True).start()
+                threading.Thread(target=_relay, args=(target, client),
+                                 daemon=True).start()
+            try:
+                srv.close()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_accept_loop, daemon=True)
+        t.start()
+        with _port_forwards_lock:
+            _port_forwards[fid] = {
+                "stop": stop, "thread": t,
+                "listen_port": actual_port,
+                "target_host": target_host,
+                "target_port": target_port,
+            }
+        self._send(200, {"ok": True, "forward_id": fid,
+                         "listen_port": actual_port})
+
+    def _handle_forward_remove(self, body):
+        """Remove a TCP port forward. body: {forward_id}."""
+        fid = body.get("forward_id", "")
+        with _port_forwards_lock:
+            fwd = _port_forwards.pop(fid, None)
+        if not fwd:
+            self._send(404, {"error": "forward not found"})
+            return
+        fwd["stop"].set()
+        self._send(200, {"ok": True})
+
+    def _handle_forward_list(self, body):
+        """List active TCP port forwards."""
+        with _port_forwards_lock:
+            forwards = [
+                {"forward_id": fid,
+                 "listen_port": f["listen_port"],
+                 "target_host": f["target_host"],
+                 "target_port": f["target_port"]}
+                for fid, f in _port_forwards.items()
+            ]
+        self._send(200, {"ok": True, "forwards": forwards})
 
     def _handle_registry_get(self, body):
         """Read a registry value. body: {path} like

@@ -181,10 +181,54 @@ class WinRemote:
         """List running processes, optionally filtered by name substring."""
         return self._req("POST", "/proc/list", {"name": name})
 
-    def shell_exec(self, command, timeout=30):
-        """Run a PowerShell command on H410M. Returns {stdout, stderr, exit_code}."""
+    def shell_exec(self, command, timeout=30, bitness="64"):
+        """Run a PowerShell command on H410M.
+        bitness: "64" (default) or "32" for 32-bit PowerShell.
+        Returns {stdout, stderr, exit_code}."""
         return self._req("POST", "/shell/exec",
-                         {"command": command, "timeout": timeout})
+                         {"command": command, "timeout": timeout,
+                          "bitness": bitness})
+
+    def session_create(self, bitness="64"):
+        """Create a persistent shell session (like SSH).
+        cwd, env vars, and functions persist across exec calls.
+        Returns {session_id}."""
+        return self._req("POST", "/shell/session/create",
+                         {"bitness": bitness})
+
+    def session_exec(self, session_id, command, timeout=30):
+        """Run a command in a persistent session."""
+        return self._req("POST", "/shell/session/exec",
+                         {"session_id": session_id,
+                          "command": command, "timeout": timeout})
+
+    def session_close(self, session_id):
+        """Close a persistent shell session."""
+        return self._req("POST", "/shell/session/close",
+                         {"session_id": session_id})
+
+    def session_list(self):
+        """List active shell sessions."""
+        return self._req("GET", "/shell/session/list")
+
+    def forward_add(self, target_port, target_host="127.0.0.1",
+                    listen_port=0):
+        """Create a TCP port forward (SSH -L equivalent).
+        Listens on H410M's listen_port (0=auto) and forwards to
+        target_host:target_port. Returns {forward_id, listen_port}."""
+        return self._req("POST", "/net/forward/add",
+                         {"listen_port": listen_port,
+                          "target_host": target_host,
+                          "target_port": target_port})
+
+    def forward_remove(self, forward_id):
+        """Remove a TCP port forward."""
+        return self._req("POST", "/net/forward/remove",
+                         {"forward_id": forward_id})
+
+    def forward_list(self):
+        """List active TCP port forwards."""
+        return self._req("GET", "/net/forward/list")
 
     def registry_get(self, path):
         """Read a registry value or key. Path like 'HKLM:\\SOFTWARE\\...'."""
