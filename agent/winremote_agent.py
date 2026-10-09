@@ -309,6 +309,8 @@ def _apply_update(tmp):
 
 
 def _restart_into_new():
+    # 2026-10-09: detached-spawn restart verified live on H410M. os.execv
+    # into python.exe is broken on this box (silently kills the process).
     """Restart the agent into the just-installed new file.
 
     NOTE (2026-10-09, proven on H410M — do NOT "simplify" back to os.execv):
