@@ -243,6 +243,36 @@ class WinRemote:
         """SendKeys string, e.g. '{ENTER}', '^v' (Ctrl+V)."""
         return self._req("POST", "/input/sendkeys", {"keys": keys})
 
+    def right_click_at(self, x, y):
+        """Right-click at screen coordinates."""
+        return self._req("POST", "/uia/right_click_at", {"x": x, "y": y})
+
+    def mouse_move(self, x, y):
+        """Move the cursor without clicking."""
+        return self._req("POST", "/input/mouse_move", {"x": x, "y": y})
+
+    def mouse_down(self, button="left"):
+        """Press a mouse button down. button: left|right|middle."""
+        return self._req("POST", "/input/mouse_down", {"button": button})
+
+    def mouse_up(self, button="left"):
+        """Release a mouse button. button: left|right|middle."""
+        return self._req("POST", "/input/mouse_up", {"button": button})
+
+    def drag(self, x1, y1, x2, y2, button="left", steps=10):
+        """Drag from (x1,y1) to (x2,y2) as a single gesture."""
+        return self._req("POST", "/input/drag",
+                         {"x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                          "button": button, "steps": steps})
+
+    def clipboard_get(self):
+        """Read text from the Windows clipboard."""
+        return self._req("POST", "/clipboard/get", {})
+
+    def clipboard_set(self, text):
+        """Write text to the Windows clipboard."""
+        return self._req("POST", "/clipboard/set", {"text": text})
+
     def activate(self, window):
         return self._req("POST", "/window/activate", {"window": window})
 

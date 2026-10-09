@@ -525,6 +525,13 @@ class Handler(BaseHTTPRequestHandler):
                 "/uia/focus": self._handle_focus,
                 "/uia/click_at": self._handle_click_at,
                 "/uia/double_click_at": self._handle_double_click_at,
+                "/uia/right_click_at": self._handle_right_click_at,
+                "/input/mouse_move": self._handle_mouse_move,
+                "/input/mouse_down": self._handle_mouse_down,
+                "/input/mouse_up": self._handle_mouse_up,
+                "/input/drag": self._handle_drag,
+                "/clipboard/get": self._handle_clipboard_get,
+                "/clipboard/set": self._handle_clipboard_set,
                 "/input/sendkeys": self._handle_sendkeys,
                 "/window/activate": self._handle_activate,
                 "/update/check": self._handle_update_check,
@@ -1086,6 +1093,127 @@ class Handler(BaseHTTPRequestHandler):
             u.mouse_event(0x04, 0, 0, 0, 0)  # left up
             _time.sleep(0.06)
         self._send(200, {"ok": True, "x": x, "y": y})
+
+    def _handle_right_click_at(self, body):
+        # Real mouse right-click at screen coordinates.
+        import ctypes
+        x, y = int(body.get("x", 0)), int(body.get("y", 0))
+        u = ctypes.windll.user32
+        u.SetCursorPos(x, y)
+        u.mouse_event(0x08, 0, 0, 0, 0)  # right down
+        u.mouse_event(0x10, 0, 0, 0, 0)  # right up
+        self._send(200, {"ok": True, "x": x, "y": y})
+
+    def _handle_mouse_move(self, body):
+        # Move the cursor without clicking.
+        import ctypes
+        x, y = int(body.get("x", 0)), int(body.get("y", 0))
+        ctypes.windll.user32.SetCursorPos(x, y)
+        self._send(200, {"ok": True, "x": x, "y": y})
+
+    def _handle_mouse_down(self, body):
+        # Press a mouse button down (for drags). button: left|right|middle.
+        import ctypes
+        button = str(body.get("button", "left")).lower()
+        flag = {"left": 0x02, "right": 0x08, "middle": 0x20}.get(button, 0x02)
+        ctypes.windll.user32.mouse_event(flag, 0, 0, 0, 0)
+        self._send(200, {"ok": True, "button": button})
+
+    def _handle_mouse_up(self, body):
+        # Release a mouse button. button: left|right|middle.
+        import ctypes
+        button = str(body.get("button", "left")).lower()
+        flag = {"left": 0x04, "right": 0x10, "middle": 0x40}.get(button, 0x04)
+        ctypes.windll.user32.mouse_event(flag, 0, 0, 0, 0)
+        self._send(200, {"ok": True, "button": button})
+
+    def _handle_drag(self, body):
+        # Drag from (x1,y1) to (x2,y2) in one request so the press,
+        # move, and release happen as a single gesture.
+        import ctypes
+        import time as _time
+        x1, y1 = int(body.get("x1", 0)), int(body.get("y1", 0))
+        x2, y2 = int(body.get("x2", 0)), int(body.get("y2", 0))
+        button = str(body.get("button", "left")).lower()
+        down = {"left": 0x02, "right": 0x08, "middle": 0x20}.get(button, 0x02)
+        up = {"left": 0x04, "right": 0x10, "middle": 0x40}.get(button, 0x04)
+        steps = max(2, int(body.get("steps", 10)))
+        u = ctypes.windll.user32
+        u.SetCursorPos(x1, y1)
+        _time.sleep(0.05)
+        u.mouse_event(down, 0, 0, 0, 0)
+        _time.sleep(0.05)
+        for i in range(1, steps + 1):
+            x = x1 + (x2 - x1) * i // steps
+            y = y1 + (y2 - y1) * i // steps
+            u.SetCursorPos(x, y)
+            _time.sleep(0.01)
+        u.mouse_event(up, 0, 0, 0, 0)
+        self._send(200, {"ok": True, "x1": x1, "y1": y1,
+                         "x2": x2, "y2": y2, "button": button})
+
+    def _handle_clipboard_get(self, body):
+        # Read text from the Windows clipboard.
+        # Returns {ok, text} or {ok, text: None} if no text available.
+        import ctypes
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        text = None
+        try:
+            if u.OpenClipboard(None):
+                try:
+                    # CF_UNICODETEXT = 13
+                    handle = u.GetClipboardData(13)
+                    if handle:
+                        ptr = k.GlobalLock(handle)
+                        if ptr:
+                            try:
+                                text = ctypes.wstring_at(ptr)
+                            finally:
+                                k.GlobalUnlock(handle)
+                finally:
+                    u.CloseClipboard()
+        except Exception:
+            pass
+        self._send(200, {"ok": True, "text": text})
+
+    def _handle_clipboard_set(self, body):
+        # Write text to the Windows clipboard.
+        # body: {text}. Returns {ok}.
+        import ctypes
+        text = body.get("text", "")
+        if not isinstance(text, str):
+            self._send(400, {"error": "text must be a string"})
+            return
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        ok = False
+        try:
+            if u.OpenClipboard(None):
+                try:
+                    u.EmptyClipboard()
+                    # Allocate global memory for UTF-16 + null terminator
+                    data = (text + "\x00").encode("utf-16-le")
+                    hmem = k.GlobalAlloc(0x0042, len(data))  # GMEM_MOVEABLE|ZEROINIT
+                    if hmem:
+                        ptr = k.GlobalLock(hmem)
+                        if ptr:
+                            ctypes.memmove(ptr, data, len(data))
+                            k.GlobalUnlock(hmem)
+                            # CF_UNICODETEXT = 13; system owns hmem on success
+                            if u.SetClipboardData(13, hmem):
+                                ok = True
+                            else:
+                                k.GlobalFree(hmem)
+                finally:
+                    u.CloseClipboard()
+        except Exception as e:
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            return
+        if ok:
+            self._send(200, {"ok": True})
+        else:
+            self._send(500, {"error": "failed to set clipboard"})
 
     def _handle_sendkeys(self, body):
         import subprocess
