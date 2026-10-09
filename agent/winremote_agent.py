@@ -12,8 +12,9 @@ in both directions.
 
 Self-updating: every --update-interval seconds (default 600) the agent
 compares its own file hash against the latest on GitHub main; on change
-it canary-tests the new version on port 8766 and re-execs into it.
-Disable with --no-auto-update or WINREMOTE_AUTO_UPDATE=0.
+it canary-tests the new version on port 8766 and re-execs into it, but
+only after --update-idle seconds (default 180) with no incoming requests
+— never mid-work. Disable with --no-auto-update or WINREMOTE_AUTO_UPDATE=0.
 
 No per-operation scheduled tasks. No file polling. Sub-second latency.
 
@@ -247,7 +248,8 @@ UPDATE_URL = os.environ.get(
     "WINREMOTE_UPDATE_URL",
     "https://raw.githubusercontent.com/germanygsg/winremote/main/agent/winremote_agent.py")
 
-_update_state = {"auto": True, "last_check": 0, "last_result": "never"}
+_update_state = {"auto": True, "last_check": 0, "last_result": "never",
+                 "last_request": 0, "idle_seconds": 180}
 _update_lock = threading.Lock()
 _server = None  # set in main(); used to free the port before re-exec
 
@@ -315,10 +317,14 @@ def _restart_into_new():
     os.execv(sys.executable, [sys.executable, _agent_path()] + sys.argv[1:])
 
 
-def update_now():
+def update_now(force=False):
     """Run one update check. Returns (updated: bool, message: str).
-    Never restarts directly: the caller schedules _restart_into_new()
-    after responding, so /update/check can answer before the exec."""
+
+    Unless force=True, a staged update is only applied when the agent has
+    been idle (no requests for idle_seconds) — never in the middle of
+    someone's work. Never restarts directly: the caller schedules
+    _restart_into_new() after responding, so /update/check can answer
+    before the exec."""
     if not _update_lock.acquire(blocking=False):
         return False, "update already in progress"
     try:
@@ -334,6 +340,16 @@ def update_now():
             except OSError:
                 pass
             return False, "canary failed - keeping current version"
+        if not force:
+            idle_for = time.time() - _update_state["last_request"]
+            if idle_for < _update_state["idle_seconds"]:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                _update_state["last_result"] = (
+                    f"deferred: busy {int(idle_for)}s ago, retrying next check")
+                return False, "update deferred - agent is busy, will retry next check"
         _apply_update(tmp)
         _update_state["last_result"] = "new version staged, restarting"
         return True, "new version downloaded and verified - restarting into it"
@@ -395,6 +411,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth():
             self._send(401, {"error": "unauthorized"})
             return
+        _update_state["last_request"] = time.time()
         try:
             query = parse_qs(parsed.query)
             if path == "/file/info":
@@ -413,6 +430,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth():
             self._send(401, {"error": "unauthorized"})
             return
+        _update_state["last_request"] = time.time()
         _com_init()
         if path == "/file/upload":
             # Raw-byte upload (not JSON): body is one chunk, target path and
@@ -996,8 +1014,9 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True})
 
     def _handle_update_check(self, body):
-        """Trigger an update check now (auth required)."""
-        updated, msg = update_now()
+        """Trigger an update check now (auth required). Explicit trigger:
+        applies immediately even if the agent is busy."""
+        updated, msg = update_now(force=True)
         self._send(200, {"ok": True, "updated": updated, "message": msg})
         if updated:
             # Respond first, then re-exec into the new version.
@@ -1115,6 +1134,9 @@ def main():
     ap.add_argument("--update-interval", type=int,
                     default=int(os.environ.get("WINREMOTE_UPDATE_INTERVAL", "600")),
                     help="seconds between update checks (0 disables)")
+    ap.add_argument("--update-idle", type=int,
+                    default=int(os.environ.get("WINREMOTE_UPDATE_IDLE", "180")),
+                    help="only apply updates after this many idle seconds (0 = always)")
     args = ap.parse_args()
 
     do_update = args.auto_update
@@ -1123,6 +1145,7 @@ def main():
     if args.update_interval <= 0:
         do_update = False
     _update_state["auto"] = do_update
+    _update_state["idle_seconds"] = max(0, args.update_idle)
 
     if auto is None:
         print("ERROR: uiautomation not installed. Run: pip install uiautomation mss Pillow")

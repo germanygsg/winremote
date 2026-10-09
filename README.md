@@ -103,8 +103,10 @@ against `main` on GitHub. On change it compile-checks the new file,
 canary-starts it on port 8766 (must answer `/health`), then re-execs
 into it. A failed canary keeps the old version — a bad push can't brick
 it. `/health` reports update status; `POST /update/check` (auth) forces
-a check now. Disable with `--no-auto-update`, `WINREMOTE_AUTO_UPDATE=0`,
-or `--update-interval 0`.
+a check now (applies immediately, even if busy). Disable with
+`--no-auto-update`, `WINREMOTE_AUTO_UPDATE=0`, or `--update-interval 0`.
+Tune the idle gate with `--update-idle` / `WINREMOTE_UPDATE_IDLE`
+(seconds of no requests before an update applies, default 180).
 
 Tradeoff to know: the agent runs elevated and executes code fetched over
 HTTPS from this repo. Fine for your own repo; if the GitHub account were
