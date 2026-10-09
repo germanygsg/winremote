@@ -172,6 +172,15 @@ class WinRemote:
         are seconds apart over HTTP and miss the double-click window."""
         return self._req("POST", "/uia/double_click_at", {"x": x, "y": y})
 
+    def proc_start(self, path, args=None, cwd=None):
+        """Start a process in the agent's interactive session. Returns pid."""
+        return self._req("POST", "/proc/start",
+                         {"path": path, "args": args or [], "cwd": cwd})
+
+    def proc_list(self, name=""):
+        """List running processes, optionally filtered by name substring."""
+        return self._req("POST", "/proc/list", {"name": name})
+
     def sendkeys(self, keys):
         """SendKeys string, e.g. '{ENTER}', '^v' (Ctrl+V)."""
         return self._req("POST", "/input/sendkeys", {"keys": keys})

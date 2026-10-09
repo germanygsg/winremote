@@ -509,6 +509,8 @@ class Handler(BaseHTTPRequestHandler):
                 "/input/sendkeys": self._handle_sendkeys,
                 "/window/activate": self._handle_activate,
                 "/update/check": self._handle_update_check,
+                "/proc/start": self._handle_proc_start,
+                "/proc/list": self._handle_proc_list,
             }[path](body)
         except KeyError:
             self._send(404, {"error": "not found"})
@@ -1075,6 +1077,55 @@ class Handler(BaseHTTPRequestHandler):
         if updated:
             # Respond first, then re-exec into the new version.
             threading.Timer(2.0, _restart_into_new).start()
+
+    def _handle_proc_start(self, body):
+        """Start a process in the agent's interactive session.
+        body: {path, args=[], cwd=null}. Returns {ok, pid}."""
+        import subprocess
+        path = body.get("path", "")
+        if not path or not os.path.isfile(path):
+            self._send(400, {"error": "path must be an existing file"})
+            return
+        args = body.get("args") or []
+        if not isinstance(args, list):
+            self._send(400, {"error": "args must be a list"})
+            return
+        cwd = body.get("cwd") or os.path.dirname(os.path.abspath(path))
+        try:
+            proc = subprocess.Popen(
+                [path] + [str(a) for a in args],
+                cwd=cwd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            return
+        self._send(200, {"ok": True, "pid": proc.pid})
+
+    def _handle_proc_list(self, body):
+        """List running processes: {name} filter optional. Returns [{pid, name}]."""
+        import subprocess
+        name = (body.get("name") or "").lower()
+        try:
+            out = subprocess.check_output(
+                ["tasklist", "/fo", "csv", "/nh"],
+                text=True, stderr=subprocess.DEVNULL, timeout=15)
+        except Exception as e:
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            return
+        procs = []
+        for line in out.splitlines():
+            parts = [p.strip('"') for p in line.split('","')]
+            if len(parts) >= 2:
+                pname, pid = parts[0], parts[1]
+                if not name or name in pname.lower():
+                    try:
+                        procs.append({"pid": int(pid), "name": pname})
+                    except ValueError:
+                        pass
+        self._send(200, {"ok": True, "processes": procs})
 
     def _handle_activate(self, body):
         el = find_window(body.get("window", ""))
