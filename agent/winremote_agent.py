@@ -261,6 +261,8 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             if path == "/file/info":
                 self._handle_file_info(query)
+            elif path == "/file/list":
+                self._handle_file_list(query)
             elif path == "/file/download":
                 self._handle_file_download(query)
             else:
@@ -881,6 +883,23 @@ class Handler(BaseHTTPRequestHandler):
         st = os.stat(path)
         self._send(200, {"ok": True, "path": path, "size": st.st_size,
                          "mtime": st.st_mtime, "is_dir": os.path.isdir(path)})
+
+    def _handle_file_list(self, query):
+        path = _resolve_path(query.get("path", [""])[0])
+        if not os.path.isdir(path):
+            self._send(404, {"error": "not a directory"})
+            return
+        entries = []
+        with os.scandir(path) as it:
+            for e in it:
+                try:
+                    st = e.stat()
+                except OSError:
+                    continue
+                entries.append({"name": e.name, "is_dir": e.is_dir(),
+                                "size": st.st_size, "mtime": st.st_mtime})
+        entries.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+        self._send(200, {"ok": True, "path": path, "entries": entries})
 
     def _handle_file_download(self, query):
         path = _resolve_path(query.get("path", [""])[0])

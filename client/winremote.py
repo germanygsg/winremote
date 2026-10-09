@@ -200,6 +200,11 @@ class WinRemote:
         return self._req("GET", "/file/info?path=" +
                          urllib.parse.quote(remote_path, safe=""))
 
+    def list_dir(self, remote_path):
+        """List a directory on the Windows machine (dirs first)."""
+        return self._req("GET", "/file/list?path=" +
+                         urllib.parse.quote(remote_path, safe=""))
+
     def upload(self, local_path, remote_path, chunk_size=1024 * 1024):
         """Upload a local file to the Windows machine, chunked + resumable.
 

@@ -84,6 +84,7 @@ agent.sendkeys("{ENTER}")
 | POST | `/input/sendkeys` | SendKeys. Body: `{"keys": "{ENTER}"}` |
 | POST | `/window/activate` | Bring window forward. Body: `{"window": "Name"}` |
 | GET | `/file/info?path=...` | File metadata: `{"size", "mtime", "is_dir"}` |
+| GET | `/file/list?path=...` | Directory listing: `{"entries": [{"name", "is_dir", "size", "mtime"}]}` |
 | GET | `/file/download?path=...&offset=0&length=1048576` | Raw bytes chunk of a file (ranged, resumable) |
 | POST | `/file/upload` | Raw bytes chunk in body; headers `X-File-Path`, `X-File-Offset`, `X-File-Size` |
 
