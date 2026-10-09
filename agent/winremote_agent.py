@@ -1139,9 +1139,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "command is required"})
             return
         timeout = min(int(body.get("timeout", 30)), 120)
+        ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
         try:
             proc = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [ps, "-NoProfile", "-ExecutionPolicy", "Bypass",
                  "-Command", cmd],
                 capture_output=True, text=True, timeout=timeout,
                 cwd=os.path.expanduser("~"))
@@ -1163,6 +1164,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "path is required"})
             return
         try:
+            # Handle HKLM:\... or HKLM\... formats
+            path = path.replace(":", "")
             hive_name, _, rest = path.partition("\\")
             hive = {"HKLM": winreg.HKEY_LOCAL_MACHINE,
                     "HKCU": winreg.HKEY_CURRENT_USER,
@@ -1207,6 +1210,7 @@ class Handler(BaseHTTPRequestHandler):
                     "REG_EXPAND_SZ": winreg.REG_EXPAND_SZ}
         vtype = type_map.get(body.get("type", "REG_SZ"), winreg.REG_SZ)
         try:
+            path = path.replace(":", "")
             hive_name, _, rest = path.partition("\\")
             hive = {"HKLM": winreg.HKEY_LOCAL_MACHINE,
                     "HKCU": winreg.HKEY_CURRENT_USER,
