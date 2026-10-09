@@ -35,6 +35,19 @@ operation) with direct calls (<1s).
 3. Note the token in `%APPDATA%\winremote\token.txt`.
 4. The agent starts at every logon and listens on port 8765.
 
+## Updating the agent (H410M)
+
+On the Windows machine, in any PowerShell:
+
+```powershell
+iwr https://raw.githubusercontent.com/germanygsg/winremote/main/setup/deploy-update.ps1 -OutFile $env:TEMP\wr-upd.ps1; & $env:TEMP\wr-upd.ps1
+```
+
+It downloads the latest agent, canary-starts it on port 8766 to prove it
+works, then swaps it in on 8765 via the `WinRemoteAgent` scheduled task
+(elevated). Safe to re-run; aborts before touching the old agent if the
+canary fails.
+
 ## Quick start (controlling machine)
 
 ```python
