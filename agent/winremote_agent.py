@@ -309,27 +309,32 @@ def _apply_update(tmp):
 
 
 def _restart_into_new():
-    # 2026-10-09: detached-spawn restart verified live on H410M. os.execv
-    # into python.exe is broken on this box (silently kills the process).
     """Restart the agent into the just-installed new file.
 
-    NOTE (2026-10-09, proven on H410M — do NOT "simplify" back to os.execv):
-    os.execv(sys.executable, ...) into python.exe silently TERMINATES the
-    process on this box (Python 3.14, Windows): no exception, no replacement
-    image, the process just vanishes. Verified in 4 trials — main thread,
-    Timer thread, plain thread, and with server.shutdown() — while
-    os.execv into cmd.exe works fine. So the restart spawns a detached child
-    and exits instead of exec'ing.
+    Spawns a detached child running the new file, then exits this process
+    immediately with os._exit(0). Deliberately does NOT call
+    _server.shutdown() or _server.server_close() first.
+
+    WHY (proven on H410M 2026-10-09, three separate reproductions):
+    calling _server.shutdown() — or even _server.server_close() — from the
+    restart Timer thread silently TERMINATES the whole process: no exception
+    (both were wrapped in try/except BaseException with logging), no crash
+    in the Event Log, the process just vanishes mid-call. The same calls
+    work fine in isolation, so it is an interaction with the production
+    runtime (main thread in serve_forever + interpreter-shutdown race).
+    Since we os._exit(0) right after spawning, graceful shutdown is
+    unnecessary anyway: the OS reclaims the listening socket on process
+    exit, and SO_REUSE_ADDRESS (set by HTTPServer) lets the child bind the
+    port immediately with no race.
+
+    ALSO do NOT "simplify" back to os.execv: os.execv(sys.executable, ...)
+    into python.exe silently TERMINATES the process on this box (Python
+    3.14, Windows) — no exception, no replacement image. Verified in 4
+    trials (main thread, Timer thread, plain thread, with/without
+    shutdown) while os.execv into cmd.exe works fine.
     """
-    if _server is not None:
-        try:
-            _server.shutdown()
-        except Exception:
-            pass
-        try:
-            _server.server_close()  # free the port BEFORE the child binds it
-        except Exception:
-            pass
+    # NOTE: no shutdown()/server_close() here — see docstring. Straight
+    # to spawn + exit.
     time.sleep(1)
     agent_dir = os.path.dirname(_agent_path())
     DETACHED_PROCESS = 0x00000008
