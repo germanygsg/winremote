@@ -467,6 +467,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/uia/select": self._handle_select,
                 "/uia/focus": self._handle_focus,
                 "/uia/click_at": self._handle_click_at,
+                "/uia/double_click_at": self._handle_double_click_at,
                 "/input/sendkeys": self._handle_sendkeys,
                 "/window/activate": self._handle_activate,
                 "/update/check": self._handle_update_check,
@@ -1000,6 +1001,21 @@ class Handler(BaseHTTPRequestHandler):
         ctypes.windll.user32.SetCursorPos(x, y)
         ctypes.windll.user32.mouse_event(0x02, 0, 0, 0, 0)  # left down
         ctypes.windll.user32.mouse_event(0x04, 0, 0, 0, 0)  # left up
+        self._send(200, {"ok": True, "x": x, "y": y})
+
+    def _handle_double_click_at(self, body):
+        # Real mouse double-click. Must be one request: two click_at calls
+        # are seconds apart over HTTP and never fall inside Windows'
+        # double-click time window.
+        import ctypes
+        import time as _time
+        x, y = int(body.get("x", 0)), int(body.get("y", 0))
+        u = ctypes.windll.user32
+        for _ in range(2):
+            u.SetCursorPos(x, y)
+            u.mouse_event(0x02, 0, 0, 0, 0)  # left down
+            u.mouse_event(0x04, 0, 0, 0, 0)  # left up
+            _time.sleep(0.06)
         self._send(200, {"ok": True, "x": x, "y": y})
 
     def _handle_sendkeys(self, body):

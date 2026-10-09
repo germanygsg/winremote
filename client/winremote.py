@@ -167,6 +167,11 @@ class WinRemote:
         """Real mouse click at screen coordinates."""
         return self._req("POST", "/uia/click_at", {"x": x, "y": y})
 
+    def double_click_at(self, x, y):
+        """Real mouse double-click. Must be server-side: two click_at calls
+        are seconds apart over HTTP and miss the double-click window."""
+        return self._req("POST", "/uia/double_click_at", {"x": x, "y": y})
+
     def sendkeys(self, keys):
         """SendKeys string, e.g. '{ENTER}', '^v' (Ctrl+V)."""
         return self._req("POST", "/input/sendkeys", {"keys": keys})
