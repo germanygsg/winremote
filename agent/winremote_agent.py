@@ -6,8 +6,14 @@ Runs on the Windows machine in the interactive session. Exposes an HTTP API
 for fast UIA-based GUI automation: screenshots, element trees, clicks,
 text input (including WebView2 via ValuePattern), and keyboard input.
 
-Also carries chunked file transfers (GET /file/info, GET /file/download,
-POST /file/upload): raw bytes, ranged and resumable in both directions.
+Also carries chunked file transfers (GET /file/info, GET /file/list,
+GET /file/download, POST /file/upload): raw bytes, ranged and resumable
+in both directions.
+
+Self-updating: every --update-interval seconds (default 600) the agent
+compares its own file hash against the latest on GitHub main; on change
+it canary-tests the new version on port 8766 and re-execs into it.
+Disable with --no-auto-update or WINREMOTE_AUTO_UPDATE=0.
 
 No per-operation scheduled tasks. No file polling. Sub-second latency.
 
@@ -24,6 +30,7 @@ import io
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -224,6 +231,134 @@ def _prune_handles():
 
 
 # ----------------------------------------------------------------------------
+# Self-update: poll GitHub for a new agent file, canary-test it, re-exec.
+#
+# Every --update-interval seconds the agent downloads the latest
+# winremote_agent.py from GitHub main and compares its sha256 with the
+# running file. On change it compile-checks the candidate, starts it on
+# port 8766 and requires /health 200, then atomically replaces the file
+# and re-execs into the new version (token/env inherited, no port race).
+# A failed canary keeps the old version and retries at the next interval,
+# so a bad push can never brick the agent.
+# Disable with --no-auto-update or WINREMOTE_AUTO_UPDATE=0.
+# ----------------------------------------------------------------------------
+
+UPDATE_URL = os.environ.get(
+    "WINREMOTE_UPDATE_URL",
+    "https://raw.githubusercontent.com/germanygsg/winremote/main/agent/winremote_agent.py")
+
+_update_state = {"auto": True, "last_check": 0, "last_result": "never"}
+_update_lock = threading.Lock()
+_server = None  # set in main(); used to free the port before re-exec
+
+
+def _agent_path():
+    return os.path.abspath(__file__)
+
+
+def _check_for_update():
+    """Download the candidate agent and compare hashes.
+    Returns (changed: bool, tmp_path: str|None)."""
+    import hashlib
+    import urllib.request
+    cur = _agent_path()
+    with open(cur, "rb") as f:
+        cur_hash = hashlib.sha256(f.read()).hexdigest()
+    req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "winremote-agent"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = resp.read()
+    if hashlib.sha256(data).hexdigest() == cur_hash:
+        return False, None
+    tmp = cur + ".new"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    return True, tmp
+
+
+def _canary_ok(path, token):
+    """Start the candidate on :8766 and require /health 200 (≤15s)."""
+    import subprocess
+    import urllib.request
+    proc = subprocess.Popen(
+        [sys.executable, path, "--port", "8766", "--token", token or "canary"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(15):
+            time.sleep(1)
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:8766/health", timeout=3) as r:
+                    if r.status == 200:
+                        return True
+            except Exception:
+                pass
+        return False
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _apply_update(tmp):
+    import py_compile
+    py_compile.compile(tmp, doraise=True)
+    os.replace(tmp, _agent_path())
+
+
+def _restart_into_new():
+    if _server is not None:
+        try:
+            _server.shutdown()
+        except Exception:
+            pass
+    time.sleep(1)
+    os.execv(sys.executable, [sys.executable, _agent_path()] + sys.argv[1:])
+
+
+def update_now():
+    """Run one update check. Returns (updated: bool, message: str).
+    Never restarts directly: the caller schedules _restart_into_new()
+    after responding, so /update/check can answer before the exec."""
+    if not _update_lock.acquire(blocking=False):
+        return False, "update already in progress"
+    try:
+        changed, tmp = _check_for_update()
+        _update_state["last_check"] = time.time()
+        if not changed:
+            _update_state["last_result"] = "up to date"
+            return False, "already up to date"
+        if not _canary_ok(tmp, Handler.token):
+            _update_state["last_result"] = "canary failed, keeping current version"
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return False, "canary failed - keeping current version"
+        _apply_update(tmp)
+        _update_state["last_result"] = "new version staged, restarting"
+        return True, "new version downloaded and verified - restarting into it"
+    except Exception as e:
+        _update_state["last_result"] = f"error: {type(e).__name__}: {e}"
+        return False, f"update check failed: {type(e).__name__}: {e}"
+    finally:
+        _update_lock.release()
+
+
+def _update_loop(interval):
+    time.sleep(15)  # let the agent settle before the first check
+    while True:
+        try:
+            updated, msg = update_now()
+            print(f"[update] {msg}", flush=True)
+            if updated:
+                threading.Timer(2.0, _restart_into_new).start()
+                return  # this process image is about to be replaced
+        except Exception as e:
+            print(f"[update] loop error: {e}", flush=True)
+        time.sleep(interval)
+
+
+# ----------------------------------------------------------------------------
 # HTTP API
 # ----------------------------------------------------------------------------
 
@@ -252,7 +387,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/health":
-            self._send(200, {"ok": True, "service": "winremote-agent", "time": time.time()})
+            self._send(200, {"ok": True, "service": "winremote-agent", "time": time.time(),
+                             "update": {"auto": _update_state["auto"],
+                                        "last_check": _update_state["last_check"],
+                                        "last_result": _update_state["last_result"]}})
             return
         if not self._auth():
             self._send(401, {"error": "unauthorized"})
@@ -313,6 +451,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/uia/click_at": self._handle_click_at,
                 "/input/sendkeys": self._handle_sendkeys,
                 "/window/activate": self._handle_activate,
+                "/update/check": self._handle_update_check,
             }[path](body)
         except KeyError:
             self._send(404, {"error": "not found"})
@@ -856,6 +995,14 @@ class Handler(BaseHTTPRequestHandler):
             capture_output=True, timeout=15)
         self._send(200, {"ok": True})
 
+    def _handle_update_check(self, body):
+        """Trigger an update check now (auth required)."""
+        updated, msg = update_now()
+        self._send(200, {"ok": True, "updated": updated, "message": msg})
+        if updated:
+            # Respond first, then re-exec into the new version.
+            threading.Timer(2.0, _restart_into_new).start()
+
     def _handle_activate(self, body):
         el = find_window(body.get("window", ""))
         if not el:
@@ -956,11 +1103,26 @@ class ThreadedHTTPServer(__import__("socketserver").ThreadingMixIn,
 
 
 def main():
+    global _server
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--token", default=os.environ.get("WINREMOTE_TOKEN", ""))
     ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--auto-update", dest="auto_update", action="store_true", default=None,
+                    help="check GitHub for a new agent version periodically (default on)")
+    ap.add_argument("--no-auto-update", dest="auto_update", action="store_false",
+                    help="disable self-updates")
+    ap.add_argument("--update-interval", type=int,
+                    default=int(os.environ.get("WINREMOTE_UPDATE_INTERVAL", "600")),
+                    help="seconds between update checks (0 disables)")
     args = ap.parse_args()
+
+    do_update = args.auto_update
+    if do_update is None:
+        do_update = os.environ.get("WINREMOTE_AUTO_UPDATE", "1") == "1"
+    if args.update_interval <= 0:
+        do_update = False
+    _update_state["auto"] = do_update
 
     if auto is None:
         print("ERROR: uiautomation not installed. Run: pip install uiautomation mss Pillow")
@@ -972,7 +1134,13 @@ def main():
 
     Handler.token = token
     server = ThreadedHTTPServer((args.host, args.port), Handler)
+    _server = server
     threading.Thread(target=_prune_handles, daemon=True).start()
+    if do_update:
+        threading.Thread(target=_update_loop, args=(args.update_interval,), daemon=True).start()
+        print(f"auto-update on: checking {UPDATE_URL} every {args.update_interval}s", flush=True)
+    else:
+        print("auto-update off", flush=True)
     print(f"winremote-agent listening on {args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()

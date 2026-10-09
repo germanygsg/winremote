@@ -83,6 +83,7 @@ agent.sendkeys("{ENTER}")
 | POST | `/uia/focus` | Focus element. Body: `{"handle"}` |
 | POST | `/input/sendkeys` | SendKeys. Body: `{"keys": "{ENTER}"}` |
 | POST | `/window/activate` | Bring window forward. Body: `{"window": "Name"}` |
+| POST | `/update/check` | Check GitHub for a new agent version now; canary-tests and restarts into it |
 | GET | `/file/info?path=...` | File metadata: `{"size", "mtime", "is_dir"}` |
 | GET | `/file/list?path=...` | Directory listing: `{"entries": [{"name", "is_dir", "size", "mtime"}]}` |
 | GET | `/file/download?path=...&offset=0&length=1048576` | Raw bytes chunk of a file (ranged, resumable) |
@@ -94,6 +95,20 @@ from that offset, so a dropped connection restarts mid-file, not from zero.
 Paths must be absolute. There is no delete/rename endpoint by design.
 
 Element `handle`s expire after 5 minutes of disuse — call `/uia/find` again.
+
+## Auto-update
+
+The agent self-updates: every 10 minutes it compares its own file hash
+against `main` on GitHub. On change it compile-checks the new file,
+canary-starts it on port 8766 (must answer `/health`), then re-execs
+into it. A failed canary keeps the old version — a bad push can't brick
+it. `/health` reports update status; `POST /update/check` (auth) forces
+a check now. Disable with `--no-auto-update`, `WINREMOTE_AUTO_UPDATE=0`,
+or `--update-interval 0`.
+
+Tradeoff to know: the agent runs elevated and executes code fetched over
+HTTPS from this repo. Fine for your own repo; if the GitHub account were
+compromised that would be remote code execution on the machine.
 
 ## Security notes
 

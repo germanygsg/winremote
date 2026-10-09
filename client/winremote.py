@@ -205,6 +205,10 @@ class WinRemote:
         return self._req("GET", "/file/list?path=" +
                          urllib.parse.quote(remote_path, safe=""))
 
+    def update_check(self):
+        """Ask the agent to check GitHub for a new version right now."""
+        return self._req("POST", "/update/check", {})
+
     def upload(self, local_path, remote_path, chunk_size=1024 * 1024):
         """Upload a local file to the Windows machine, chunked + resumable.
 
