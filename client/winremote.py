@@ -273,6 +273,24 @@ class WinRemote:
         """Write text to the Windows clipboard."""
         return self._req("POST", "/clipboard/set", {"text": text})
 
+    def lock_state(self):
+        """Check if the workstation is locked. Returns {locked: bool}."""
+        return self._req("GET", "/system/lock/state")
+
+    def lock_screenshot(self):
+        """Screenshot the lock screen. Returns PNG bytes."""
+        data, ctype = self._req("GET", "/system/lock/screenshot",
+                               raw_response=True)
+        return data
+
+    def lock_type(self, text):
+        """Type text on the lock screen (no Enter)."""
+        return self._req("POST", "/system/lock/type", {"text": text})
+
+    def lock_unlock(self, pin):
+        """Type PIN + Enter on the lock screen to unlock."""
+        return self._req("POST", "/system/lock/unlock", {"pin": pin})
+
     def activate(self, window):
         return self._req("POST", "/window/activate", {"window": window})
 

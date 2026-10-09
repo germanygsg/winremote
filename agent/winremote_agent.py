@@ -477,6 +477,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_session_list({})
             elif path == "/net/forward/list":
                 self._handle_forward_list({})
+            elif path == "/system/lock/state":
+                self._handle_system_proxy("/system/lock/state", {})
+            elif path == "/system/lock/screenshot":
+                self._handle_system_proxy("/system/lock/screenshot", {})
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:
@@ -532,6 +536,10 @@ class Handler(BaseHTTPRequestHandler):
                 "/input/drag": self._handle_drag,
                 "/clipboard/get": self._handle_clipboard_get,
                 "/clipboard/set": self._handle_clipboard_set,
+                "/system/lock/state": lambda b: self._handle_system_proxy("/system/lock/state", b),
+                "/system/lock/screenshot": lambda b: self._handle_system_proxy("/system/lock/screenshot", b),
+                "/system/lock/type": lambda b: self._handle_system_proxy("/system/lock/type", b),
+                "/system/lock/unlock": lambda b: self._handle_system_proxy("/system/lock/unlock", b),
                 "/input/sendkeys": self._handle_sendkeys,
                 "/window/activate": self._handle_activate,
                 "/update/check": self._handle_update_check,
@@ -1189,6 +1197,100 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True, "text": text})
 
     def _handle_clipboard_set(self, body):
+        # Write text to the Windows clipboard.
+        # body: {text}. Returns {ok}.
+        import ctypes
+        from ctypes import wintypes
+        text = body.get("text", "")
+        if not isinstance(text, str):
+            self._send(400, {"error": "text must be a string"})
+            return
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        u.OpenClipboard.argtypes = [wintypes.HWND]
+        u.OpenClipboard.restype = wintypes.BOOL
+        u.EmptyClipboard.argtypes = []
+        u.EmptyClipboard.restype = wintypes.BOOL
+        u.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        u.SetClipboardData.restype = wintypes.HANDLE
+        u.CloseClipboard.argtypes = []
+        u.CloseClipboard.restype = wintypes.BOOL
+        k.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        k.GlobalAlloc.restype = wintypes.HANDLE
+        k.GlobalLock.argtypes = [wintypes.HANDLE]
+        k.GlobalLock.restype = wintypes.LPVOID
+        k.GlobalUnlock.argtypes = [wintypes.HANDLE]
+        k.GlobalUnlock.restype = wintypes.BOOL
+        k.GlobalFree.argtypes = [wintypes.HANDLE]
+        k.GlobalFree.restype = wintypes.HANDLE
+        ok = False
+        try:
+            if u.OpenClipboard(None):
+                try:
+                    u.EmptyClipboard()
+                    data = (text + "\x00").encode("utf-16-le")
+                    hmem = k.GlobalAlloc(0x0042, len(data))
+                    if hmem:
+                        ptr = k.GlobalLock(hmem)
+                        if ptr:
+                            ctypes.memmove(ptr, data, len(data))
+                            k.GlobalUnlock(hmem)
+                            if u.SetClipboardData(13, hmem):
+                                ok = True
+                            else:
+                                k.GlobalFree(hmem)
+                finally:
+                    u.CloseClipboard()
+        except Exception as e:
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            return
+        if ok:
+            self._send(200, {"ok": True})
+        else:
+            self._send(500, {"error": "failed to set clipboard"})
+
+    def _handle_system_proxy(self, path, body):
+        """Proxy to the WinRemote SYSTEM service (lock screen handler)
+        on 127.0.0.1:8767. The SYSTEM service runs as LocalSystem and
+        can interact with the Winlogon secure desktop."""
+        import urllib.request
+        url = f"http://127.0.0.1:8767{path}"
+        # Forward the bearer token
+        token = os.environ.get("WINREMOTE_TOKEN", "")
+        # Try to read from the same sources the agent uses
+        if not token:
+            for p in (os.path.join(os.environ.get("APPDATA", ""),
+                                   "winremote", "token.txt"),
+                      r"C:\ProgramData\WinRemote\token.txt"):
+                try:
+                    with open(p) as f:
+                        token = f.read().strip()
+                        if token:
+                            break
+                except Exception:
+                    pass
+        data = json.dumps(body).encode() if body else None
+        req = urllib.request.Request(
+            url, data=data,
+            method="POST" if data else "GET",
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                ctype = resp.headers.get("Content-Type", "")
+                raw = resp.read()
+                if "image/" in ctype:
+                    self._send(200, raw=raw, ctype=ctype)
+                else:
+                    self._send(200, json.loads(raw or b"{}"))
+        except urllib.error.HTTPError as e:
+            try:
+                detail = json.loads(e.read() or b"{}")
+            except Exception:
+                detail = {"error": e.reason}
+            self._send(e.code, detail)
+        except Exception as e:
+            self._send(502, {"error": f"system service unreachable: {e}"})
         # Write text to the Windows clipboard.
         # body: {text}. Returns {ok}.
         import ctypes
