@@ -265,13 +265,29 @@ UPDATE_URL = os.environ.get(
     "https://raw.githubusercontent.com/germanygsg/winremote/main/agent/winremote_agent.py")
 
 _update_state = {"auto": True, "last_check": 0, "last_result": "never",
-                 "last_request": 0, "idle_seconds": 180}
+                 "last_request": 0, "idle_seconds": 180, "stale_restarts": 0}
 _update_lock = threading.Lock()
 _server = None  # set in main(); used to free the port before re-exec
 
 
 def _agent_path():
     return os.path.abspath(__file__)
+
+
+def _sha256_file(path):
+    import hashlib
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+# sha256 of the agent file THIS process image was loaded from, captured once
+# at startup. update_now() compares it against the on-disk file so a stale
+# process (file replaced, process never actually re-execed) is detected
+# instead of the check lying "already up to date".
+try:
+    _LOADED_HASH = _sha256_file(os.path.abspath(__file__))
+except Exception:
+    _LOADED_HASH = ""
 
 
 def _check_for_update():
@@ -282,7 +298,12 @@ def _check_for_update():
     cur = _agent_path()
     with open(cur, "rb") as f:
         cur_hash = hashlib.sha256(f.read()).hexdigest()
-    req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "winremote-agent"})
+    # Cache-buster: raw.githubusercontent.com serves through a CDN that can
+    # hand back the pre-push file for minutes after a push, which would make
+    # this check falsely report "already up to date".
+    sep = "&" if "?" in UPDATE_URL else "?"
+    url = UPDATE_URL + sep + "t=" + str(int(time.time()))
+    req = urllib.request.Request(url, headers={"User-Agent": "winremote-agent"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = resp.read()
     if hashlib.sha256(data).hexdigest() == cur_hash:
@@ -384,6 +405,28 @@ def update_now(force=False):
         changed, tmp = _check_for_update()
         _update_state["last_check"] = time.time()
         if not changed:
+            # The on-disk file matches GitHub - but is the RUNNING process
+            # actually that file? If a staged update's restart never replaced
+            # this process (port race, zombie old process), the old image
+            # keeps answering while the file is new. Reporting "up to date"
+            # here is a lie; re-exec into the current file instead.
+            try:
+                disk_hash = _sha256_file(_agent_path())
+            except Exception:
+                disk_hash = ""
+            if _LOADED_HASH and disk_hash and disk_hash != _LOADED_HASH:
+                n = _update_state.get("stale_restarts", 0) + 1
+                _update_state["stale_restarts"] = n
+                if n > 3:
+                    # The restarts are not taking effect; stop spawning and
+                    # say so plainly instead of looping forever.
+                    _update_state["last_result"] = (
+                        "stale image: %d auto-restarts failed, manual restart required" % n)
+                    return False, ("running image is stale and automatic restarts "
+                                   "are not taking effect - restart the WinRemoteAgent "
+                                   "scheduled task manually")
+                _update_state["last_result"] = "stale image, restarting into updated file"
+                return True, "running image is stale, restarting into the updated file"
             _update_state["last_result"] = "up to date"
             return False, "already up to date"
         if not _canary_ok(tmp, Handler.token):
@@ -457,6 +500,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/health":
             self._send(200, {"ok": True, "service": "winremote-agent", "time": time.time(),
+                             "image_hash": _LOADED_HASH[:12],
                              "update": {"auto": _update_state["auto"],
                                         "last_check": _update_state["last_check"],
                                         "last_result": _update_state["last_result"]}})
