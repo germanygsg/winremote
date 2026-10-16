@@ -863,26 +863,43 @@ class Handler(BaseHTTPRequestHandler):
 
             user32 = ctypes.windll.user32
 
+            # NOTE: the KEYBDINPUT must be wrapped as
+            # INPUT(type=..., u=_INPUT_UNION(ki=...)). Passing ki=... directly
+            # to the INPUT constructor does NOT raise -- ctypes silently
+            # stores it as a plain Python attribute, leaving the union's
+            # memory all zeros. SendInput then "succeeds" sending N null
+            # key events (wVk=0, wScan=0) and nothing appears on screen
+            # while the handler reports ok:true. That was the live bug:
+            # type_text returned ok while delivering nothing.
             inputs = []
             for ch in text:
-                # Key down
-                ki_down = KEYBDINPUT(
-                    wVk=0,
-                    wScan=ord(ch),
-                    dwFlags=KEYEVENTF_UNICODE,
-                    time=0,
-                    dwExtraInfo=None,
-                )
-                inputs.append(INPUT(type=INPUT_KEYBOARD, ki=ki_down))
-                # Key up
-                ki_up = KEYBDINPUT(
-                    wVk=0,
-                    wScan=ord(ch),
-                    dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                    time=0,
-                    dwExtraInfo=None,
-                )
-                inputs.append(INPUT(type=INPUT_KEYBOARD, ki=ki_up))
+                code = ord(ch)
+                # KEYEVENTF_UNICODE takes UTF-16 units: split astral
+                # characters (e.g. emoji) into a surrogate pair, else
+                # wScan overflows WORD and ctypes raises.
+                units = [code] if code <= 0xFFFF else [
+                    0xD800 + ((code - 0x10000) >> 10),
+                    0xDC00 + ((code - 0x10000) & 0x3FF),
+                ]
+                for unit in units:
+                    # Key down
+                    ki_down = KEYBDINPUT(
+                        wVk=0,
+                        wScan=unit,
+                        dwFlags=KEYEVENTF_UNICODE,
+                        time=0,
+                        dwExtraInfo=None,
+                    )
+                    inputs.append(INPUT(type=INPUT_KEYBOARD, u=_INPUT_UNION(ki=ki_down)))
+                    # Key up
+                    ki_up = KEYBDINPUT(
+                        wVk=0,
+                        wScan=unit,
+                        dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                        time=0,
+                        dwExtraInfo=None,
+                    )
+                    inputs.append(INPUT(type=INPUT_KEYBOARD, u=_INPUT_UNION(ki=ki_up)))
 
             n = len(inputs)
             arr = (INPUT * n)(*inputs)
@@ -950,9 +967,12 @@ class Handler(BaseHTTPRequestHandler):
             user32 = ctypes.windll.user32
 
             def make_input(vk, flags=0):
+                # Same ctypes gotcha as type_text: the KEYBDINPUT must go
+                # through u=_INPUT_UNION(ki=...). A bare ki=... kwarg is
+                # silently dropped, sending null key events that do nothing.
                 return INPUT(
                     type=INPUT_KEYBOARD,
-                    ki=KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=None)
+                    u=_INPUT_UNION(ki=KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=None))
                 )
 
             inputs = []
