@@ -794,20 +794,125 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "text required"})
             return
         try:
-            import subprocess
-            safe = text.replace("'", "''")
-            # Set clipboard, then Ctrl+A (select all), Ctrl+V (paste)
-            ps = (f"$v = @'\n{safe}\n'@; Set-Clipboard $v; "
-                  "Add-Type -AssemblyName System.Windows.Forms; "
-                  "[System.Windows.Forms.SendKeys]::SendWait('^a'); "
-                  "Start-Sleep -m 150; "
-                  "[System.Windows.Forms.SendKeys]::SendWait('^v'); "
-                  "Start-Sleep -m 300; "
-                  "Set-Clipboard ''")
-            subprocess.run(
-                [r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-                 "-NoProfile", "-Command", ps],
-                capture_output=True, timeout=15)
+            import ctypes
+            from ctypes import wintypes
+            # Previously this used PowerShell Set-Clipboard +
+            # SendKeys::SendWait('^a'/'^v'). That path silently delivered
+            # nothing: SendKeys' journal-playback hook does not reach the
+            # target window from this elevated agent process (same class of
+            # silent failure as the old type_text bug -- ok:true, no effect).
+            # Now: clipboard via direct Win32 API (same as /clipboard/set),
+            # keys via SendInput (same as press_key). No PowerShell.
+            # The clipboard is deliberately NOT cleared afterwards: clearing
+            # races the target app reading it, and standard paste leaves
+            # the clipboard intact.
+            u = ctypes.windll.user32
+            k = ctypes.windll.kernel32
+            u.OpenClipboard.argtypes = [wintypes.HWND]
+            u.OpenClipboard.restype = wintypes.BOOL
+            u.EmptyClipboard.argtypes = []
+            u.EmptyClipboard.restype = wintypes.BOOL
+            u.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+            u.SetClipboardData.restype = wintypes.HANDLE
+            u.CloseClipboard.argtypes = []
+            u.CloseClipboard.restype = wintypes.BOOL
+            k.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+            k.GlobalAlloc.restype = wintypes.HANDLE
+            k.GlobalLock.argtypes = [wintypes.HANDLE]
+            k.GlobalLock.restype = wintypes.LPVOID
+            k.GlobalUnlock.argtypes = [wintypes.HANDLE]
+            k.GlobalUnlock.restype = wintypes.BOOL
+            k.GlobalFree.argtypes = [wintypes.HANDLE]
+            k.GlobalFree.restype = wintypes.HANDLE
+            if not u.OpenClipboard(None):
+                self._send(500, {"error": "paste_text failed: OpenClipboard failed"})
+                return
+            try:
+                u.EmptyClipboard()
+                data = (text + "\x00").encode("utf-16-le")
+                hmem = k.GlobalAlloc(0x0042, len(data))
+                if not hmem:
+                    self._send(500, {"error": "paste_text failed: GlobalAlloc failed"})
+                    return
+                ptr = k.GlobalLock(hmem)
+                if not ptr:
+                    k.GlobalFree(hmem)
+                    self._send(500, {"error": "paste_text failed: GlobalLock failed"})
+                    return
+                try:
+                    ctypes.memmove(ptr, data, len(data))
+                finally:
+                    k.GlobalUnlock(hmem)
+                if not u.SetClipboardData(13, hmem):  # CF_UNICODETEXT
+                    k.GlobalFree(hmem)
+                    self._send(500, {"error": "paste_text failed: SetClipboardData failed"})
+                    return
+            finally:
+                u.CloseClipboard()
+
+            # Ctrl+A (select all) then Ctrl+V (paste) via SendInput.
+            # INPUT must be built as INPUT(type=..., u=_INPUT_UNION(ki=...))
+            # -- see type_text for why a bare ki=... kwarg silently sends
+            # null key events.
+            class MOUSEINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("dx", wintypes.LONG),
+                    ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_void_p),
+                ]
+
+            class KEYBDINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("wVk", wintypes.WORD),
+                    ("wScan", wintypes.WORD),
+                    ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_void_p),
+                ]
+
+            class _INPUT_UNION(ctypes.Union):
+                _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
+
+            class INPUT(ctypes.Structure):
+                _fields_ = [
+                    ("type", wintypes.DWORD),
+                    ("u", _INPUT_UNION),
+                ]
+
+            INPUT_KEYBOARD = 1
+            KEYEVENTF_KEYUP = 0x0002
+            VK_CTRL = 0x11
+            VK_A = 0x41
+            VK_V = 0x56
+
+            def make_input(vk, flags=0):
+                return INPUT(
+                    type=INPUT_KEYBOARD,
+                    u=_INPUT_UNION(ki=KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=None))
+                )
+
+            inputs = [
+                make_input(VK_CTRL, 0), make_input(VK_A, 0),
+                make_input(VK_A, KEYEVENTF_KEYUP), make_input(VK_CTRL, KEYEVENTF_KEYUP),
+            ]
+            n = len(inputs)
+            arr = (INPUT * n)(*inputs)
+            if u.SendInput(n, arr, ctypes.sizeof(INPUT)) != n:
+                self._send(500, {"error": "paste_text failed: SendInput Ctrl+A incomplete"})
+                return
+            time.sleep(0.15)
+            inputs = [
+                make_input(VK_CTRL, 0), make_input(VK_V, 0),
+                make_input(VK_V, KEYEVENTF_KEYUP), make_input(VK_CTRL, KEYEVENTF_KEYUP),
+            ]
+            n = len(inputs)
+            arr = (INPUT * n)(*inputs)
+            if u.SendInput(n, arr, ctypes.sizeof(INPUT)) != n:
+                self._send(500, {"error": "paste_text failed: SendInput Ctrl+V incomplete"})
+                return
             self._send(200, {"ok": True, "method": "paste_text"})
         except Exception as e:
             self._send(500, {"error": f"paste_text failed: {e}"})
