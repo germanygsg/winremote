@@ -8,7 +8,7 @@
     it on port 8766 and health-checks it, then stops the old agent (:8765) and
     starts the new one elevated via the WinRemoteAgent scheduled task.
 
-    Safe to re-run. Run from any PowerShell in the user's session — stopping
+    Safe to re-run. Run from any PowerShell in the user's session - stopping
     own-session processes needs no admin, and schtasks /run executes the task
     with its stored "highest privileges".
 
