@@ -19,7 +19,7 @@ only after --update-idle seconds (default 180) with no incoming requests
 No per-operation scheduled tasks. No file polling. Sub-second latency.
 
 Usage:
-    python winremote_agent.py [--port 8765] [--token TOKEN]
+    python winremote_agent.py [--port 8765] [--token TOKEN] [--no-tray]
 
     Token can also be set via WINREMOTE_TOKEN env var.
     If no token is provided, one is generated and printed on startup.
@@ -265,7 +265,8 @@ UPDATE_URL = os.environ.get(
     "https://raw.githubusercontent.com/germanygsg/winremote/main/agent/winremote_agent.py")
 
 _update_state = {"auto": True, "last_check": 0, "last_result": "never",
-                 "last_request": 0, "idle_seconds": 180, "stale_restarts": 0}
+                 "last_request": 0, "idle_seconds": 180, "stale_restarts": 0,
+                 "interval_s": 600}
 _update_lock = threading.Lock()
 _server = None  # set in main(); used to free the port before re-exec
 
@@ -319,7 +320,8 @@ def _canary_ok(path, token):
     import subprocess
     import urllib.request
     proc = subprocess.Popen(
-        [sys.executable, path, "--port", "8766", "--token", token or "canary"],
+        [sys.executable, path, "--port", "8766", "--token", token or "canary",
+         "--no-tray"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         for _ in range(15):
@@ -460,14 +462,18 @@ def _update_loop(interval):
     time.sleep(15)  # let the agent settle before the first check
     while True:
         try:
-            updated, msg = update_now()
-            print(f"[update] {msg}", flush=True)
-            if updated:
-                threading.Timer(2.0, _restart_into_new).start()
-                return  # this process image is about to be replaced
+            # The tray can toggle auto-update and the interval at runtime
+            # (settings.json), so both are re-read every cycle instead of
+            # being frozen at process start.
+            if _update_state["auto"]:
+                updated, msg = update_now()
+                print(f"[update] {msg}", flush=True)
+                if updated:
+                    threading.Timer(2.0, _restart_into_new).start()
+                    return  # this process image is about to be replaced
         except Exception as e:
             print(f"[update] loop error: {e}", flush=True)
-        time.sleep(interval)
+        time.sleep(max(5, int(_update_state.get("interval_s", interval) or interval)))
 
 
 # ----------------------------------------------------------------------------
@@ -501,6 +507,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self._send(200, {"ok": True, "service": "winremote-agent", "time": time.time(),
                              "image_hash": _LOADED_HASH[:12],
+                             "paused": bool(_perm_state["paused"]),
+                             "disabled_categories": _disabled_categories(),
                              "update": {"auto": _update_state["auto"],
                                         "last_check": _update_state["last_check"],
                                         "last_result": _update_state["last_result"]}})
@@ -509,9 +517,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401, {"error": "unauthorized"})
             return
         _update_state["last_request"] = time.time()
+        if not _permission_gate(self, path):
+            return
         try:
             query = parse_qs(parsed.query)
-            if path == "/file/info":
+            if path == "/settings":
+                self._handle_settings_get()
+            elif path == "/file/info":
                 self._handle_file_info(query)
             elif path == "/file/list":
                 self._handle_file_list(query)
@@ -536,6 +548,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401, {"error": "unauthorized"})
             return
         _update_state["last_request"] = time.time()
+        if not _permission_gate(self, path):
+            return
         _com_init()
         if path == "/file/upload":
             # Raw-byte upload (not JSON): body is one chunk, target path and
@@ -1534,6 +1548,15 @@ class Handler(BaseHTTPRequestHandler):
             # Respond first, then re-exec into the new version.
             threading.Timer(2.0, _restart_into_new).start()
 
+    def _handle_settings_get(self):
+        """GET /settings: the EFFECTIVE settings (diagnostics, read-only).
+
+        There is deliberately no write endpoint: settings and permissions
+        can only be changed from the local tray UI, so a token holder can
+        never un-pause or widen permissions remotely. See the TRAY /
+        SETTINGS / PERMISSIONS section."""
+        self._send(200, {"ok": True, "settings": _effective_settings()})
+
     def _handle_proc_start(self, body):
         """Start a process in the agent's interactive session.
         body: {path, args=[], cwd=null}. Returns {ok, pid}."""
@@ -2006,36 +2029,1376 @@ class Handler(BaseHTTPRequestHandler):
                          "complete": total is not None and written >= total})
 
 
+# ----------------------------------------------------------------------------
+# TRAY / SETTINGS / PERMISSIONS — local UI
+# (design: docs/tray-frontend-design.md)
+#
+# Everything in this section serves the person sitting at THIS machine:
+# a system-tray icon, a settings.json next to token.txt, per-category API
+# permissions, and clean lifecycle actions (pause / restart / quit).
+#
+# Hard rules from the design:
+# - Single file: this section lives in winremote_agent.py because the
+#   self-updater downloads exactly this one file.
+# - Zero new dependencies: the tray is raw Win32 via ctypes, windows are
+#   stdlib tkinter/ttk, the icon is an embedded PNG (base64 below) with a
+#   state dot drawn by Pillow at runtime.
+# - Permissions are LOCAL-ONLY: the HTTP API exposes them read-only
+#   (GET /settings, plus fields on /health). There is deliberately no
+#   remote write path, so a token holder can never un-pause or widen
+#   permissions from the network.
+# - Failure isolation: every entry point here is wrapped so an exception
+#   can never reach the HTTP server path. If the tray cannot start, the
+#   agent prints a warning and continues headless, exactly as before.
+# ----------------------------------------------------------------------------
+
+import ctypes
+from ctypes import wintypes
+
+_start_time = 0  # set in main(); uptime = time.time() - _start_time
+
+# Effective runtime values resolved in main() (CLI > settings > env > defaults)
+_runtime_config = {"port": 8765, "host": "0.0.0.0", "no_tray": False}
+
+# The settings.json document as loaded / last saved. Tray saves rewrite
+# this dict back to disk atomically.
+_settings_doc = {}
+_settings_lock = threading.RLock()
+
+# Tray icon artwork: renders of assets/winremote.png (the flat TV-remote
+# handset chosen 2026-11-02), embedded so the self-updater stays a
+# single-file download. The state dot is drawn over the lower-right
+# corner at runtime — the artwork itself is never recoloured.
+_TRAY_ICON_PNG_16 = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACBklEQVR42mWTsWsUQRjFf9/M7N1u1ot3iKLRWqKdxH9AUNBCwVqwtAg24h9iZ+E/oWAjWGoaQbA40gex0UQTk1xyuzfzLHZvPc9pZhjmfe+9b75nV64/fCTpRZLOIRlgADjHPyul+UmYyZnb855ntrb+4EC4VZTUgZNw0wraCwGp3wNnC0WcGToMEqsQBWZzJhV9dm9vEM8UAPijCaOPY+y0mhcxlCRsEEBalO0mUw5u3eDs47tkJ1MA6qLPUUwM330ilgWkSEMohY65VeYMpkWPO3kBtRob+Qpvix7WGeogFpqLuVsjCXLneb3zlcs+A+Dbzz0GzpE6seooA0vLO+O4rnl67SpPzl8A4NWP77x8/5mRg9SBtVxAgIhKlFnGzdGQwjvA2BgNKXsZMWmZD7coHwNvxqSu2asqcu/JveNXVTGpa3zXLnWY0ADVKjKiRD8Enn8Z82E4BODN/j5l8MQF73OMA3U9kZq6sxi5t3aR4xg5njXnOqaFOTKQLffg72/64NneP6A/mYLBNEW89+2k898vtIaaLQHZScWOIqRZm4MZq6cV0tIUwHyQJDCzJNTvsbI1huBJg2aU3eEJK1tjUtHDusi0mEvr93+DGzRhMhPC2jA1T9uI9DPwbcskmfNm6NBlwW+a2S6YpMalnCOWBaksiGVOLPMm3hIgmZnM2A3BNv8ASvDqRIt2tRsAAAAASUVORK5CYII="
+_TRAY_ICON_PNG_32 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAFmklEQVR42r2Xy48c1RXGf+feqm7P9DAZt2BsnHEMBMgkxARkEhEeEhCisEmibHiIf4CQiA2rLLLKOtmQRXYoCAkMK8QCRBJMbB4OyLYUxCCkBPltMzOahz3j6emquh+Lqu6qru6xZ5OUNOrH3HvPd873ne+eNoDb7n7iu5tJ+qcsyx4MIYwDxv/mkTO34SN/eGLcPT/38etzdvuBp2bXr2z8XfhvKiT8Px5zEWY6P95sPOrHdt76ivB3KesmmPntnWCj/7b7hCzBoqkQ0lnbM/uLJAR5s22cYAYSlqSg3ncCGRgojvprtkOHmWWRRDQ6dvWQPEPrJqgRk+zdhZwVS5T/LwSir5b7a7YBwiRF0XBQK4NW43cTkplpVp7+KdmuKSgSl8BZvtXPLzP18t+Izy1sFwSuDHyVxRKKPCtPPEKyb5qwmRLSFGUBQkbopoRuQrJvF6tPPoIiPyL46Biumu1IwAaWBrL2JOn0N7C1DXa3xphpjROZEZtjZmKc3a1x3NoGyfROsvYklmY1YY6WWFSW3bYQshWt41AQeydbHH/4ASbjmF9+9AlB8OZ9P+RyknLg0BFOXbqMObs2rSUAY2sdqP8qCXOO8xsdHjp8lKZ3/Gd9HQE/fu8DNrPAuc5mDlRcI/MyRjTYSsXrwGYbOCST+Gx1FbKsz9nxKxvgPTjXI/NaDVCnAIQwVTeP5syZEULgxokJHp2+HgH/mF/kwto6znu0HRc39ZygoEDFNqNWgeHgWZLw+LdmeOHu/Zy8sgHAH+/8Hs+d+JSDp8/ivR8s9VBVewzkNLgtvaf2pTPI0pT97Z0cvPcepptNXjp1hr+eOsN0s8mr997Dne2dZEmKq6pZWxibqhrIU89p2EI8zgzSlGdu2ceJlVWWul3+fNd+AN6dX2Qqjnnm2zfx7FcLOGo6Mg1ad8VfoiofVudJ9UyMvWNjvHb2PN0Q+Mn0DQC8dXEeb8b9N7RHKF2DyffOLOJGw2Ufsan3weCd+UVe+MEdLHUTPl5eAYnfzd5Ku9HguX9/VtyM2kL1lRYvgLh6mw1sqByUSbg45sUvT3JseZV2I+bl02d56fQ52o0Gx5dXefG/J3FxTBbqXqKavwwY0ajWUw2wCMWtt56lPHbkI/7w/VmeveUmBPzly5P8/tPPWctSnLl+Y1cr1/f6fqepJkILgzhUr4nleLxnsdPh1/86RtRsApB2NiHyWByhNAxnqhq9FupdUKpVsqLyhgrEVkEkwfXjY8TOcbGzCcCeqUm6WWAx6VbuE9uiqlbBZ6UT9lRukIMwlYcV7xUCe1stjj38INfFMb86+gmSeOO+H3E5SThw6H1OX1rL54OtTKgPIqcoGlVvs5oPyHJQzrjQ2eRnHxyl4Txzl9eQxEP//JBuCJzf6GBmBBX3vIYvtdIXhii4+r3de1KJE4vL+bLCdo8uLBaSjmpGVkvOCg5VmlNUupT1lSsxzKVy9Cbh4ggzIytuQxfn41cmYVcbSlXGKH2gUib1508bGsf80iWihRXUGiOEkAcXSCJIhBCgtQO/sIxfulQZy1TB03tfVsb1AldafoQhOSzNmDr4LvGZeRRHyDsUOSzyyDuII+IzC0wdPFQbx6yiKRsKYjd+5+ca5MoqyavcYy4fuZsx6e52ZSynHMsvLmGb1bFc19RUZOZSKficPhv1O6TAF/KDs4z41MWye1VSptgXwcPQbJHftFazJwXnnR0xFxsoHR6di188/S0BzKFmTGjEqNmAHQ20I0LN3q+iUCRvQwJUUVVJqbnYIu8Pu+ZE/FsjXHA+HpwN8oW5nwzAEgo9JQekkH+uKV9D3qLCzMH5ODLLLuxoNn/jl87NLczcfMfbWWq3Ce2RFPXnkkpH9EFU29psQFP52lx0Vh1GSm3JOdeJvHvvupZ7+otjr899DXsEyDcCWR/fAAAAAElFTkSuQmCC"
+
+# --- permission categories ---------------------------------------------------
+
+# Category -> route patterns (used for the Permissions tab route counts).
+_CATEGORY_ROUTES = {
+    "shell": ["/shell/exec", "/shell/session/create", "/shell/session/exec",
+              "/shell/session/close", "/shell/session/list"],
+    "files": ["/file/info", "/file/list", "/file/download", "/file/upload"],
+    "uia_input": ["/screenshot", "/uia/tree", "/uia/find", "/uia/invoke",
+                  "/uia/set_value", "/uia/set_value_at", "/uia/focus",
+                  "/uia/expand", "/uia/select", "/uia/click_at",
+                  "/uia/double_click_at", "/uia/right_click_at",
+                  "/input/sendkeys", "/input/type_text", "/input/press_key",
+                  "/input/paste_text", "/input/mouse_move",
+                  "/input/mouse_down", "/input/mouse_up", "/input/drag",
+                  "/window/activate"],
+    "clipboard": ["/clipboard/get", "/clipboard/set"],
+    "js": ["/js/eval", "/js/execute"],
+    "registry": ["/registry/get", "/registry/set"],
+    "proc": ["/proc/list", "/proc/start"],
+    "net": ["/net/forward/add", "/net/forward/remove", "/net/forward/list"],
+    "system": ["/system/lock/state", "/system/lock/screenshot",
+               "/system/lock/type", "/system/lock/unlock"],
+}
+
+_perm_state = {"paused": False,
+               "categories": {name: True for name in _CATEGORY_ROUTES}}
+_perm_lock = threading.Lock()
+
+# Never gated: /health (unauthenticated status), /settings (read-only
+# diagnostics), /update/check (agent lifecycle, not a capability).
+_GATE_EXEMPT = {"/health", "/settings", "/update/check"}
+
+
+def _route_category(path):
+    """Map a request path to its permission category, or None (exempt or
+    unknown — unknown paths pass the gate and 404 in dispatch as before)."""
+    if path in _GATE_EXEMPT:
+        return None
+    if path.startswith("/shell/"):
+        return "shell"
+    if path.startswith("/file/"):
+        return "files"
+    if (path == "/screenshot" or path.startswith("/uia/")
+            or path.startswith("/input/") or path == "/window/activate"):
+        return "uia_input"
+    if path.startswith("/clipboard/"):
+        return "clipboard"
+    if path.startswith("/js/"):
+        return "js"
+    if path.startswith("/registry/"):
+        return "registry"
+    if path.startswith("/proc/"):
+        return "proc"
+    if path.startswith("/net/"):
+        return "net"
+    if path.startswith("/system/"):
+        return "system"
+    return None
+
+
+def _disabled_categories():
+    with _perm_lock:
+        return [k for k, v in _perm_state["categories"].items() if not v]
+
+
+def _permission_gate(handler, path):
+    """Design section 5 gate, called from do_GET/do_POST immediately
+    after _auth() succeeds and before any dispatch. Returns True if the
+    request may proceed; otherwise sends the 403 and returns False."""
+    cat = _route_category(path)
+    if cat is None:
+        return True
+    with _perm_lock:
+        paused = _perm_state["paused"]
+        allowed = _perm_state["categories"].get(cat, True)
+    if paused:
+        handler._send(403, {"error": "paused by local user"})
+        return False
+    if not allowed:
+        handler._send(403, {"error": f"category disabled: {cat}"})
+        return False
+    return True
+
+
+# --- settings.json -----------------------------------------------------------
+
+
+def _config_dir():
+    """Directory holding token.txt / settings.json (launcher convention:
+    %APPDATA%\\winremote, with the ProgramData fallback the SYSTEM
+    service proxy already uses)."""
+    appdata = os.environ.get("APPDATA", "")
+    if appdata:
+        return os.path.join(appdata, "winremote")
+    return r"C:\ProgramData\WinRemote"
+
+
+def _settings_path():
+    return os.path.join(_config_dir(), "settings.json")
+
+
+def _load_settings_file():
+    """Read settings.json. Any problem (missing, corrupt, wrong shape)
+    yields {} — defaults win and the agent always starts."""
+    try:
+        with open(_settings_path(), "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        if not isinstance(doc, dict):
+            raise ValueError("settings root is not an object")
+        return doc
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"[settings] ignoring {_settings_path()}: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return {}
+
+
+def _apply_permissions(perm):
+    """Merge a permissions dict (from settings.json) into _perm_state."""
+    if not isinstance(perm, dict):
+        return
+    with _perm_lock:
+        if isinstance(perm.get("paused"), bool):
+            _perm_state["paused"] = perm["paused"]
+        cats = perm.get("categories")
+        if isinstance(cats, dict):
+            for k, v in cats.items():
+                if k in _perm_state["categories"] and isinstance(v, bool):
+                    _perm_state["categories"][k] = v
+
+
+def _save_settings_doc():
+    """Persist _settings_doc atomically (temp file + os.replace)."""
+    path = _settings_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_settings_doc, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _apply_settings(port=None, auto_update=None, interval_s=None, idle_s=None,
+                    paused=None, categories=None):
+    """Apply a local-UI change. Hot keys (auto_update, intervals,
+    permissions) take effect immediately; everything is persisted to
+    settings.json. Port is stored only — it applies on the next start
+    (the Settings tab offers Save & restart for exactly that)."""
+    with _settings_lock:
+        _settings_doc["version"] = 1
+        if port is not None:
+            _settings_doc["port"] = int(port)
+        if auto_update is not None:
+            _settings_doc["auto_update"] = bool(auto_update)
+            _update_state["auto"] = bool(auto_update)
+        if interval_s is not None:
+            _settings_doc["update_interval_s"] = int(interval_s)
+            _update_state["interval_s"] = int(interval_s)
+        if idle_s is not None:
+            _settings_doc["update_idle_s"] = int(idle_s)
+            _update_state["idle_seconds"] = max(0, int(idle_s))
+        if paused is not None or categories is not None:
+            perm = dict(_settings_doc.get("permissions") or {})
+            if paused is not None:
+                perm["paused"] = bool(paused)
+            if categories is not None:
+                perm["categories"] = dict(categories)
+            _settings_doc["permissions"] = perm
+            _apply_permissions(perm)
+        _save_settings_doc()
+
+
+def _effective_settings():
+    """The settings actually in force — what GET /settings reports."""
+    with _perm_lock:
+        perm = {"paused": _perm_state["paused"],
+                "categories": dict(_perm_state["categories"])}
+    return {
+        "port": _runtime_config["port"],
+        "host": _runtime_config["host"],
+        "auto_update": bool(_update_state["auto"]),
+        "update_interval_s": int(_update_state.get("interval_s", 600)),
+        "update_idle_s": int(_update_state["idle_seconds"]),
+        "permissions": perm,
+        "tray": not _runtime_config["no_tray"],
+        "settings_file": _settings_path(),
+    }
+
+
+# --- lifecycle helpers -------------------------------------------------------
+
+
+def _session_count():
+    with _shell_sessions_lock:
+        return len(_shell_sessions)
+
+
+def _forward_count():
+    with _port_forwards_lock:
+        return len(_port_forwards)
+
+
+def _close_all_sessions_and_forwards():
+    """Best-effort cleanup used by Quit: terminate child PowerShell
+    processes and stop forward threads before the process exits."""
+    with _shell_sessions_lock:
+        sessions = list(_shell_sessions.values())
+        _shell_sessions.clear()
+    for sess in sessions:
+        try:
+            sess["proc"].terminate()
+        except Exception:
+            pass
+    with _port_forwards_lock:
+        forwards = list(_port_forwards.values())
+        _port_forwards.clear()
+    for fwd in forwards:
+        try:
+            fwd["stop"].set()
+        except Exception:
+            pass
+
+
+def _schtasks(args):
+    """Run schtasks with the given arguments; return its exit code
+    (-1 if it could not run at all)."""
+    try:
+        r = subprocess.run(["schtasks"] + args, capture_output=True,
+                           text=True, timeout=15,
+                           creationflags=0x08000000)  # CREATE_NO_WINDOW
+        return r.returncode
+    except Exception:
+        return -1
+
+
+def _task_enabled(task_name):
+    """True/False when the scheduled task exists, None when it is
+    missing or cannot be queried. Parses the task XML for <Enabled>,
+    which is locale-independent (the LIST output is not)."""
+    try:
+        r = subprocess.run(["schtasks", "/query", "/tn", task_name, "/xml"],
+                           capture_output=True, text=True, timeout=15,
+                           creationflags=0x08000000)
+        if r.returncode != 0:
+            return None
+        import re
+        m = re.search(r"<Enabled>\s*(true|false)\s*</Enabled>", r.stdout, re.I)
+        if m:
+            return m.group(1).lower() == "true"
+        return True  # no <Enabled> element means enabled by default
+    except Exception:
+        return None
+
+
+def _agent_restart_argv(port_override=None):
+    """argv for a successor process: ours, with any --port pair replaced
+    when a port change must take effect (tray Save & restart)."""
+    argv = []
+    src = sys.argv[1:]
+    i = 0
+    while i < len(src):
+        if port_override is not None and src[i] == "--port" and i + 1 < len(src):
+            i += 2
+            continue
+        argv.append(src[i])
+        i += 1
+    if port_override is not None:
+        argv += ["--port", str(port_override)]
+    return argv
+
+
+def _restart_agent(port_override=None):
+    """Spawn a detached successor and exit — the same pattern the
+    self-updater proved on H410M (_restart_into_new), minus the update
+    itself. NOTE: deliberately no _server.shutdown()/server_close()
+    here either; see _restart_into_new's docstring for why those calls
+    silently kill this process."""
+    _tray_remove_icon()
+    time.sleep(0.2)
+    agent_dir = os.path.dirname(_agent_path())
+    DETACHED_PROCESS = 0x00000008
+    try:
+        subprocess.Popen(
+            [sys.executable, _agent_path()] + _agent_restart_argv(port_override),
+            cwd=agent_dir,
+            env=dict(os.environ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=DETACHED_PROCESS,
+            close_fds=False,
+        )
+    except Exception:
+        pass
+    os._exit(0)
+
+
+def _shutdown_agent():
+    """Quit: remove the icon, close sessions/forwards, stop serving
+    (shutdown on a side thread), and exit."""
+    _tray_remove_icon()
+    _close_all_sessions_and_forwards()
+
+    def _bye():
+        try:
+            if _server is not None:
+                _server.shutdown()
+        except Exception:
+            pass
+        os._exit(0)
+
+    threading.Thread(target=_bye, daemon=True).start()
+    # Belt and braces: exit shortly after even if shutdown() stalls.
+    threading.Timer(1.5, os._exit, args=(0,)).start()
+
+
+# --- tray icon (raw Win32 via ctypes, no third-party tray library) -----------
+
+_TRAY_UID = 1
+_WM_TRAY = 0x0400 + 20          # WM_USER + 20: Shell_NotifyIcon callback
+_WM_RBUTTONUP = 0x0205
+_WM_LBUTTONDBLCLK = 0x0203
+
+_MNU_STATUS = 1001
+_MNU_SETTINGS = 1002
+_MNU_PERMS = 1003
+_MNU_PAUSE = 1004
+_MNU_UPDATE = 1005
+_MNU_RESTART = 1006
+_MNU_QUIT = 1007
+_MNU_QUIT_NOAUTO = 1008
+
+_TRAY_DOT_COLORS = {"green": (46, 204, 113), "amber": (243, 156, 18),
+                    "red": (231, 76, 60)}
+
+_tray = {"hwnd": None, "hicon": None, "added": False, "taskbar_created": 0}
+
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD),
+                ("hWnd", wintypes.HWND),
+                ("uID", wintypes.UINT),
+                ("uFlags", wintypes.UINT),
+                ("uCallbackMessage", wintypes.UINT),
+                ("hIcon", wintypes.HICON),
+                ("szTip", wintypes.WCHAR * 128),
+                ("dwState", wintypes.DWORD),
+                ("dwStateMask", wintypes.DWORD),
+                ("szInfo", wintypes.WCHAR * 256),
+                ("uVersion", wintypes.UINT),
+                ("szInfoTitle", wintypes.WCHAR * 64),
+                ("dwInfoFlags", wintypes.DWORD),
+                ("guidItem", ctypes.c_byte * 16),
+                ("hBalloonIcon", wintypes.HICON)]
+
+
+class _WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT),
+                ("style", wintypes.UINT),
+                ("lpfnWndProc", ctypes.c_void_p),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE),
+                ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HANDLE),
+                ("hbrBackground", wintypes.HANDLE),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR),
+                ("hIconSm", wintypes.HICON)]
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class _MSG(ctypes.Structure):
+    _fields_ = [("hwnd", wintypes.HWND),
+                ("message", wintypes.UINT),
+                ("wParam", wintypes.WPARAM),
+                ("lParam", wintypes.LPARAM),
+                ("time", wintypes.DWORD),
+                ("pt", _POINT)]
+
+
+def _tray_icon_image(size, state):
+    """PIL image of the tray icon for a state: the embedded artwork with
+    a coloured dot (white-ringed) in the lower-right corner."""
+    from PIL import Image, ImageDraw
+    src = Image.open(io.BytesIO(base64.b64decode(_TRAY_ICON_PNG_32)))
+    src = src.convert("RGBA")
+    if src.size != (size, size):
+        src = src.resize((size, size), Image.LANCZOS)
+    dot = _TRAY_DOT_COLORS.get(state, _TRAY_DOT_COLORS["green"])
+    d = ImageDraw.Draw(src)
+    r = max(3.0, size * 0.21)
+    cx, cy = size - r - 0.5, size - r - 0.5
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255, 255))
+    ri = r - max(1.0, size * 0.05)
+    d.ellipse([cx - ri, cy - ri, cx + ri, cy + ri], fill=dot + (255,))
+    return src
+
+
+def _hicon_from_image(img):
+    """Create an HICON from a PIL RGBA image, stdlib ctypes only.
+
+    Method: Pillow serialises a single-entry .ico in memory. In a
+    single-entry ICO the image data starts at offset 22 (6-byte ICONDIR
+    + 16-byte ICONDIRENTRY) and, for PNG-compressed icons, is exactly
+    the PNG bytes — which is what CreateIconFromResourceEx consumes as
+    an RT_ICON resource. Falls back to the stock IDI_APPLICATION icon
+    if anything fails (a generic tray icon beats no tray icon)."""
+    u32 = ctypes.windll.user32
+    try:
+        u32.CreateIconFromResourceEx.argtypes = [
+            ctypes.c_void_p, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        u32.CreateIconFromResourceEx.restype = wintypes.HANDLE
+        buf = io.BytesIO()
+        img.save(buf, format="ICO", sizes=[(img.width, img.height)])
+        data = buf.getvalue()
+        raw = ctypes.create_string_buffer(data)
+        hicon = u32.CreateIconFromResourceEx(
+            ctypes.byref(raw, 22), len(data) - 22, True, 0x00030000,
+            img.width, img.height, 0)
+        if hicon:
+            return hicon
+    except Exception:
+        pass
+    try:
+        u32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+        u32.LoadIconW.restype = wintypes.HANDLE
+        return u32.LoadIconW(None, ctypes.cast(32512, wintypes.LPCWSTR))
+    except Exception:
+        return None
+
+
+def _best_ip():
+    """Best-effort address for the tooltip: Tailscale (100.64.0.0/10)
+    first, then the first non-loopback address, then loopback."""
+    try:
+        addrs = socket.gethostbyname_ex(socket.gethostname())[2]
+    except Exception:
+        addrs = []
+    for a in addrs:
+        parts = a.split(".")
+        if (len(parts) == 4 and parts[0] == "100" and parts[1].isdigit()
+                and 64 <= int(parts[1]) <= 127):
+            return a
+    for a in addrs:
+        if not a.startswith("127."):
+            return a
+    return "127.0.0.1"
+
+
+def _ip_addresses():
+    """(lan_ip, tailscale_ip) best-effort, either may be None."""
+    lan = ts = None
+    try:
+        addrs = socket.gethostbyname_ex(socket.gethostname())[2]
+    except Exception:
+        addrs = []
+    for a in addrs:
+        parts = a.split(".")
+        if (len(parts) == 4 and parts[0] == "100" and parts[1].isdigit()
+                and 64 <= int(parts[1]) <= 127):
+            ts = ts or a
+        elif not a.startswith("127."):
+            lan = lan or a
+    return lan, ts
+
+
+def _tray_state():
+    """Icon dot state, evaluated live at refresh time (never polled):
+    amber when paused or an update is staged (disk file differs from
+    the running image), red when the HTTP server does not answer on its
+    own port, green otherwise."""
+    with _perm_lock:
+        if _perm_state["paused"]:
+            return "amber"
+    try:
+        disk = _sha256_file(_agent_path())
+        if _LOADED_HASH and disk and disk != _LOADED_HASH:
+            return "amber"
+    except Exception:
+        pass
+    try:
+        with socket.create_connection(("127.0.0.1", _runtime_config["port"]),
+                                      timeout=0.4):
+            pass
+    except Exception:
+        return "red"
+    return "green"
+
+
+def _tray_tip():
+    with _perm_lock:
+        paused = _perm_state["paused"]
+    state = "Paused" if paused else "Running"
+    return (f"WinRemote · {_best_ip()}:{_runtime_config['port']} · "
+            f"{_LOADED_HASH[:7]} · {state}")
+
+
+def _tray_notify(nid, action):
+    return ctypes.windll.shell32.Shell_NotifyIconW(action, ctypes.byref(nid))
+
+
+def _tray_add_icon():
+    """NIM_ADD (or NIM_MODIFY when already added) with the current
+    state icon and tooltip."""
+    hwnd = _tray.get("hwnd")
+    if not hwnd:
+        return
+    try:
+        hicon = _hicon_from_image(_tray_icon_image(32, _tray_state()))
+        nid = _NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+        nid.hWnd = hwnd
+        nid.uID = _TRAY_UID
+        nid.uFlags = 0x1 | 0x2 | 0x4  # NIF_MESSAGE | NIF_ICON | NIF_TIP
+        nid.uCallbackMessage = _WM_TRAY
+        nid.hIcon = hicon
+        nid.szTip = _tray_tip()
+        action = 1 if _tray["added"] else 0  # NIM_MODIFY / NIM_ADD
+        if _tray_notify(nid, action):
+            old = _tray.get("hicon")
+            _tray["hicon"] = hicon
+            _tray["added"] = True
+            if old and old != hicon:
+                try:
+                    ctypes.windll.user32.DestroyIcon(old)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _tray_refresh():
+    """Re-evaluate state and update the icon/tooltip. Called when the
+    menu opens and after tray actions — never on a timer."""
+    if _tray.get("hwnd"):
+        _tray_add_icon()
+
+
+def _tray_remove_icon():
+    try:
+        hwnd = _tray.get("hwnd")
+        if hwnd and _tray.get("added"):
+            nid = _NOTIFYICONDATAW()
+            nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+            nid.hWnd = hwnd
+            nid.uID = _TRAY_UID
+            _tray_notify(nid, 2)  # NIM_DELETE
+            _tray["added"] = False
+    except Exception:
+        pass
+
+
+def _tray_show_menu():
+    """Build and show the context menu (tray thread). Labels and the
+    icon are refreshed here, at open time — there is no polling."""
+    try:
+        _tray_refresh()
+        u32 = ctypes.windll.user32
+        u32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT,
+                                    ctypes.c_size_t, wintypes.LPCWSTR]
+        u32.AppendMenuW.restype = wintypes.BOOL
+        with _perm_lock:
+            paused = _perm_state["paused"]
+        hmenu = u32.CreatePopupMenu()
+        if not hmenu:
+            return
+
+        def add(mid, text):
+            u32.AppendMenuW(hmenu, 0x0000, mid, text)  # MF_STRING
+
+        def sep():
+            u32.AppendMenuW(hmenu, 0x0800, 0, None)    # MF_SEPARATOR
+
+        add(_MNU_STATUS, "Status…")
+        add(_MNU_SETTINGS, "Settings…")
+        add(_MNU_PERMS, "Permissions…")
+        sep()
+        add(_MNU_PAUSE, "Resume remote control" if paused
+            else "Pause remote control")
+        add(_MNU_UPDATE, "Check for update now")
+        add(_MNU_RESTART, "Restart agent")
+        sep()
+        add(_MNU_QUIT, "Quit")
+        add(_MNU_QUIT_NOAUTO, "Quit && disable autostart")
+        pt = _POINT()
+        u32.GetCursorPos(ctypes.byref(pt))
+        hwnd = _tray["hwnd"]
+        u32.SetForegroundWindow(hwnd)
+        # TPM_RETURNCMD | TPM_RIGHTBUTTON: the chosen id comes back as
+        # the return value, which keeps menu handling on this thread.
+        cmd = u32.TrackPopupMenu(hmenu, 0x0100 | 0x0002, pt.x, pt.y, 0,
+                                 hwnd, None)
+        u32.PostMessageW(hwnd, 0, 0, 0)  # WM_NULL: standard dismiss fix
+        u32.DestroyMenu(hmenu)
+        if cmd:
+            _tray_menu_action(int(cmd))
+    except Exception:
+        pass
+
+
+def _tray_update_check():
+    """Menu 'Check for update now': same semantics as POST
+    /update/check (force, immediate). Runs on its own thread because a
+    check can block on the network."""
+    try:
+        updated, _msg = update_now(force=True)
+        _tray_refresh()
+        if updated:
+            def _go():
+                _tray_remove_icon()
+                _restart_into_new()
+            threading.Timer(1.0, _go).start()
+    except Exception:
+        pass
+
+
+def _tray_menu_action(cmd):
+    try:
+        if cmd == _MNU_STATUS:
+            _ui_open(0)
+        elif cmd == _MNU_SETTINGS:
+            _ui_open(1)
+        elif cmd == _MNU_PERMS:
+            _ui_open(2)
+        elif cmd == _MNU_PAUSE:
+            with _perm_lock:
+                new = not _perm_state["paused"]
+            _apply_settings(paused=new)
+            _tray_refresh()
+        elif cmd == _MNU_UPDATE:
+            threading.Thread(target=_tray_update_check, daemon=True).start()
+        elif cmd == _MNU_RESTART:
+            _restart_agent()
+        elif cmd == _MNU_QUIT:
+            _ui_quit_flow(False)
+        elif cmd == _MNU_QUIT_NOAUTO:
+            _ui_quit_flow(True)
+    except Exception:
+        pass
+
+
+def _wnd_proc(hwnd, msg, wparam, lparam):
+    """Tray window procedure. Must never raise: it runs inside the
+    tray thread's message loop, and an escape would kill the icon."""
+    try:
+        if _tray.get("taskbar_created") and msg == _tray["taskbar_created"]:
+            # Explorer restarted: the icon is gone, re-add it.
+            _tray["added"] = False
+            _tray_add_icon()
+            return 0
+        if msg == _WM_TRAY:
+            if lparam == _WM_RBUTTONUP:
+                _tray_show_menu()
+            elif lparam == _WM_LBUTTONDBLCLK:
+                _ui_open(0)
+            return 0
+        if msg == 0x0010:  # WM_CLOSE: the hidden window never closes
+            return 0
+        if msg == 0x0002:  # WM_DESTROY
+            ctypes.windll.user32.PostQuitMessage(0)
+            return 0
+    except Exception:
+        pass
+    return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+if sys.platform == "win32":
+    _WNDPROC_TYPE = ctypes.WINFUNCTYPE(
+        wintypes.LPARAM, wintypes.HWND, wintypes.UINT,
+        wintypes.WPARAM, wintypes.LPARAM)
+    _WNDPROC_INST = _WNDPROC_TYPE(_wnd_proc)  # keep the callback alive
+else:
+    _WNDPROC_INST = None
+
+
+def _tray_thread_main():
+    u32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    u32.CreateWindowExW.restype = wintypes.HWND
+    u32.GetMessageW.argtypes = [ctypes.POINTER(_MSG), wintypes.HWND,
+                                wintypes.UINT, wintypes.UINT]
+    u32.GetMessageW.restype = ctypes.c_int
+    hinst = kernel32.GetModuleHandleW(None)
+    class_name = "WinRemoteTrayWindow"
+    wc = _WNDCLASSEXW()
+    wc.cbSize = ctypes.sizeof(_WNDCLASSEXW)
+    wc.lpfnWndProc = ctypes.cast(_WNDPROC_INST, ctypes.c_void_p)
+    wc.hInstance = hinst
+    wc.lpszClassName = class_name
+    if not u32.RegisterClassExW(ctypes.byref(wc)):
+        raise RuntimeError("RegisterClassExW failed")
+    _tray["taskbar_created"] = u32.RegisterWindowMessageW("TaskbarCreated")
+    # An ordinary (non-visible) top-level window, NOT a message-only
+    # window: message-only windows do not receive the TaskbarCreated
+    # broadcast, which is how the icon survives an Explorer restart.
+    hwnd = u32.CreateWindowExW(0, class_name, "WinRemote", 0, 0, 0, 0, 0,
+                               None, None, hinst, None)
+    if not hwnd:
+        raise RuntimeError("CreateWindowExW failed")
+    _tray["hwnd"] = hwnd
+    _tray_add_icon()
+    msg = _MSG()
+    while True:
+        r = u32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+        if r <= 0:  # WM_QUIT or error
+            break
+        u32.TranslateMessage(ctypes.byref(msg))
+        u32.DispatchMessageW(ctypes.byref(msg))
+
+
+def _tray_start():
+    """Start the tray thread (called from main() after the server has
+    bound). Failure-isolated: any problem prints a warning and the
+    agent continues headless, exactly as before the tray existed."""
+    if sys.platform != "win32":
+        return
+    try:
+        threading.Thread(target=_tray_thread_guard, daemon=True,
+                         name="winremote-tray").start()
+    except Exception as e:
+        print(f"[tray] disabled: {type(e).__name__}: {e}", flush=True)
+
+
+def _tray_thread_guard():
+    try:
+        _tray_thread_main()
+    except Exception as e:
+        print(f"[tray] disabled: {type(e).__name__}: {e}", flush=True)
+
+
+# --- settings/status window (stdlib tkinter, owned by ONE UI thread) --------
+#
+# A single UI thread owns every Tk object for the process lifetime. Its
+# hidden root stays withdrawn so tray actions can focus/raise the
+# window safely; the visible window itself is created on demand and
+# destroyed on close (design section 7). Nothing outside the UI thread
+# ever touches Tk — tray code posts requests through a queue.
+
+_ui = {"started": False, "root": None, "window": None, "notebook": None,
+       "icon_img": None, "requests": queue.Queue()}
+
+
+def _ui_ensure_thread():
+    if _ui["started"]:
+        return
+    _ui["started"] = True
+    threading.Thread(target=_ui_thread_main, daemon=True,
+                     name="winremote-ui").start()
+
+
+def _ui_open(tab=0):
+    """Ask the UI thread to show the window on the given tab."""
+    _ui_ensure_thread()
+    _ui["requests"].put(("show", tab))
+
+
+def _ui_thread_main():
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        _ui["root"] = root
+        try:
+            _ui["icon_img"] = tk.PhotoImage(data=_TRAY_ICON_PNG_32)
+            root.iconphoto(True, _ui["icon_img"])
+        except Exception:
+            pass
+
+        def _drain():
+            try:
+                while True:
+                    kind, arg = _ui["requests"].get_nowait()
+                    try:
+                        if kind == "show":
+                            _ui_show_window(root, arg)
+                        elif kind == "quit":
+                            _ui_quit_dialog(root, arg)
+                        elif kind == "update_done":
+                            _ui_update_done(root, arg)
+                    except Exception:
+                        pass
+            except queue.Empty:
+                pass
+            root.after(120, _drain)
+
+        root.after(50, _drain)
+        root.mainloop()
+    except Exception as e:
+        print(f"[ui] disabled: {type(e).__name__}: {e}", flush=True)
+        _ui["started"] = False
+        _ui["root"] = None
+
+
+def _fmt_uptime():
+    s = int(max(0, time.time() - _start_time)) if _start_time else 0
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}h {m:02d}m" if h else (f"{m}m {sec:02d}s" if m else f"{sec}s")
+
+
+def _fmt_time(ts):
+    if not ts:
+        return "never"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    except Exception:
+        return "never"
+
+
+def _helper_health():
+    """SYSTEM helper (:8767) health — read when the Status tab opens,
+    never polled."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8767/health",
+                                    timeout=1) as r:
+            return "Running" if r.status == 200 else "Not running"
+    except Exception:
+        return "Not running"
+
+
+def _ui_close_window(win):
+    try:
+        win.destroy()
+    except Exception:
+        pass
+    if _ui.get("window") is win:
+        _ui["window"] = None
+        _ui["notebook"] = None
+
+
+def _ui_show_window(root, tab=0):
+    import tkinter as tk
+    from tkinter import ttk
+    win = _ui.get("window")
+    if win is not None:
+        try:
+            if win.winfo_exists():
+                win.deiconify()
+                win.lift()
+                win.focus_force()
+                nb = _ui.get("notebook")
+                if nb is not None:
+                    nb.select(tab)
+                return
+        except Exception:
+            _ui["window"] = None
+            _ui["notebook"] = None
+    win = tk.Toplevel(root)
+    _ui["window"] = win
+    win.title("WinRemote")
+    win.protocol("WM_DELETE_WINDOW", lambda: _ui_close_window(win))
+    if _ui.get("icon_img") is not None:
+        try:
+            win.iconphoto(False, _ui["icon_img"])
+        except Exception:
+            pass
+    nb = ttk.Notebook(win)
+    _ui["notebook"] = nb
+    nb.pack(fill="both", expand=True, padx=6, pady=6)
+    f_status = ttk.Frame(nb, padding=10)
+    f_settings = ttk.Frame(nb, padding=10)
+    f_perms = ttk.Frame(nb, padding=10)
+    nb.add(f_status, text="Status")
+    nb.add(f_settings, text="Settings")
+    nb.add(f_perms, text="Permissions")
+    _ui_build_status(f_status)
+    _ui_build_settings(win, f_settings)
+    _ui_build_perms(f_perms)
+    nb.select(tab)
+    win.resizable(False, False)
+
+
+def _ui_kv(parent, row, key, value):
+    from tkinter import ttk
+    ttk.Label(parent, text=key + ":", width=20, anchor="e").grid(
+        row=row, column=0, sticky="e", padx=(0, 8), pady=1)
+    ttk.Label(parent, text=value).grid(row=row, column=1, sticky="w", pady=1)
+
+
+def _ui_build_status(parent):
+    import tkinter as tk
+    from tkinter import ttk
+    for child in parent.winfo_children():
+        child.destroy()
+    eff = _effective_settings()
+    lan, ts_ip = _ip_addresses()
+    try:
+        disk = _sha256_file(_agent_path())
+        stale = bool(_LOADED_HASH and disk and disk != _LOADED_HASH)
+    except Exception:
+        stale = False
+    r = 0
+    _ui_kv(parent, r, "State",
+           "Paused" if eff["permissions"]["paused"] else "Running"); r += 1
+    _ui_kv(parent, r, "Host", socket.gethostname()); r += 1
+    _ui_kv(parent, r, "LAN IP", lan or "—"); r += 1
+    _ui_kv(parent, r, "Tailscale IP", ts_ip or "—"); r += 1
+    _ui_kv(parent, r, "Port", str(eff["port"])); r += 1
+    _ui_kv(parent, r, "Uptime", _fmt_uptime()); r += 1
+    _ui_kv(parent, r, "Build (image hash)",
+           _LOADED_HASH[:12] + ("  — on-disk file differs, restart pending"
+                                if stale else "")); r += 1
+    ttk.Separator(parent).grid(row=r, column=0, columnspan=3, sticky="ew",
+                               pady=6); r += 1
+    _ui_kv(parent, r, "Auto-update",
+           "on" if _update_state["auto"] else "off"); r += 1
+    _ui_kv(parent, r, "Last check", _fmt_time(_update_state["last_check"]))
+    r += 1
+    result_var = tk.StringVar(value=str(_update_state["last_result"]))
+    ttk.Label(parent, text="Last result:", width=20, anchor="e").grid(
+        row=r, column=0, sticky="e", padx=(0, 8), pady=1)
+    ttk.Label(parent, textvariable=result_var).grid(
+        row=r, column=1, sticky="w", pady=1)
+    btn = ttk.Button(parent, text="Check now")
+    btn.grid(row=r, column=2, sticky="w", padx=(10, 0))
+
+    def _check_now():
+        btn.state(["disabled"])
+        result_var.set("checking…")
+
+        def _work():
+            try:
+                updated, msg = update_now(force=True)
+            except Exception as e:
+                updated, msg = False, f"{type(e).__name__}: {e}"
+            _ui["requests"].put(("update_done", (updated, msg, parent,
+                                                 result_var, btn)))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    btn.configure(command=_check_now)
+    r += 1
+    ttk.Separator(parent).grid(row=r, column=0, columnspan=3, sticky="ew",
+                               pady=6); r += 1
+    _ui_kv(parent, r, "Shell sessions open", str(_session_count())); r += 1
+    _ui_kv(parent, r, "Port forwards active", str(_forward_count())); r += 1
+    _ui_kv(parent, r, "SYSTEM helper (:8767)", _helper_health()); r += 1
+    ttk.Separator(parent).grid(row=r, column=0, columnspan=3, sticky="ew",
+                               pady=6); r += 1
+    token = Handler.token
+    masked = (token[:4] + "…" + token[-4:]) if len(token) >= 8 else "—"
+    _ui_kv(parent, r, "Token", masked)
+    root = parent.winfo_toplevel()
+
+    def _copy_token():
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(Handler.token)
+        except Exception:
+            pass
+
+    ttk.Button(parent, text="Copy", command=_copy_token).grid(
+        row=r, column=2, sticky="w", padx=(10, 0)); r += 1
+
+    def _open_cfg():
+        try:
+            os.startfile(_config_dir())
+        except Exception:
+            pass
+
+    ttk.Button(parent, text="Open config folder",
+               command=_open_cfg).grid(row=r, column=1, sticky="w", pady=1)
+
+
+def _ui_update_done(root, payload):
+    """Runs on the UI thread (via the request queue) after a Status-tab
+    update check completes on its worker thread."""
+    updated, msg, parent, result_var, btn = payload
+    try:
+        result_var.set(msg)
+        btn.state(["!disabled"])
+    except Exception:
+        pass
+    _tray_refresh()
+    if updated:
+        def _go():
+            _tray_remove_icon()
+            _restart_into_new()
+        threading.Timer(1.0, _go).start()
+
+
+def _ui_build_settings(win, parent):
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    eff = _effective_settings()
+    r = 0
+    ttk.Label(parent, text="Port:", width=20, anchor="e").grid(
+        row=r, column=0, sticky="e", padx=(0, 8), pady=2)
+    port_var = tk.IntVar(value=eff["port"])
+    ttk.Spinbox(parent, from_=1, to=65535, textvariable=port_var,
+                width=10).grid(row=r, column=1, sticky="w")
+    ttk.Label(parent, text="(restart required)").grid(
+        row=r, column=2, sticky="w", padx=(8, 0)); r += 1
+    ttk.Label(parent, text="Auto-update:", width=20, anchor="e").grid(
+        row=r, column=0, sticky="e", padx=(0, 8), pady=2)
+    auto_var = tk.BooleanVar(value=eff["auto_update"])
+    ttk.Checkbutton(parent, variable=auto_var).grid(
+        row=r, column=1, sticky="w"); r += 1
+    ttk.Label(parent, text="Update interval (s):", width=20, anchor="e").grid(
+        row=r, column=0, sticky="e", padx=(0, 8), pady=2)
+    interval_var = tk.IntVar(value=eff["update_interval_s"])
+    ttk.Spinbox(parent, from_=10, to=86400, increment=10,
+                textvariable=interval_var, width=10).grid(
+        row=r, column=1, sticky="w"); r += 1
+    ttk.Label(parent, text="Update idle (s):", width=20, anchor="e").grid(
+        row=r, column=0, sticky="e", padx=(0, 8), pady=2)
+    idle_var = tk.IntVar(value=eff["update_idle_s"])
+    ttk.Spinbox(parent, from_=0, to=3600, increment=10,
+                textvariable=idle_var, width=10).grid(
+        row=r, column=1, sticky="w"); r += 1
+
+    def _collect():
+        try:
+            port = int(port_var.get())
+            if not (1 <= port <= 65535):
+                raise ValueError
+        except Exception:
+            messagebox.showerror("WinRemote", "Port must be 1–65535.",
+                                 parent=win)
+            return None
+        return {"port": port, "auto_update": bool(auto_var.get()),
+                "interval_s": max(10, int(interval_var.get())),
+                "idle_s": max(0, int(idle_var.get()))}
+
+    def _save():
+        vals = _collect()
+        if vals is None:
+            return
+        try:
+            _apply_settings(**vals)
+            _tray_refresh()
+            note = "Saved."
+            if vals["port"] != _runtime_config["port"]:
+                note += (" The port change takes effect after a restart"
+                         " (Save && restart).")
+            messagebox.showinfo("WinRemote", note, parent=win)
+        except Exception as e:
+            messagebox.showerror("WinRemote", f"Save failed: {e}",
+                                 parent=win)
+
+    def _save_restart():
+        vals = _collect()
+        if vals is None:
+            return
+        try:
+            _apply_settings(**vals)
+        except Exception as e:
+            messagebox.showerror("WinRemote", f"Save failed: {e}",
+                                 parent=win)
+            return
+        _ui_close_window(win)
+        _restart_agent(port_override=vals["port"])
+
+    btns = ttk.Frame(parent)
+    btns.grid(row=r, column=1, sticky="w", pady=(8, 2))
+    ttk.Button(btns, text="Save", command=_save).pack(side="left")
+    ttk.Button(btns, text="Save && restart", command=_save_restart).pack(
+        side="left", padx=(8, 0))
+    r += 1
+    ttk.Separator(parent).grid(row=r, column=0, columnspan=3, sticky="ew",
+                               pady=6); r += 1
+    ttk.Label(parent, text="Start at logon:", width=20, anchor="e").grid(
+        row=r, column=0, sticky="e", padx=(0, 8), pady=2)
+    logon_state = _task_enabled("WinRemoteAgent")
+    logon_var = tk.BooleanVar(value=bool(logon_state))
+    chk = ttk.Checkbutton(parent, variable=logon_var)
+    chk.grid(row=r, column=1, sticky="w")
+    if logon_state is None:
+        chk.state(["disabled"])
+        ttk.Label(parent, text="(WinRemoteAgent task not found)").grid(
+            row=r, column=2, sticky="w", padx=(8, 0))
+
+    def _toggle_logon():
+        want = bool(logon_var.get())
+        rc = _schtasks(["/change", "/tn", "WinRemoteAgent",
+                        "/enable" if want else "/disable"])
+        if rc != 0:
+            logon_var.set(not want)
+            messagebox.showerror(
+                "WinRemote",
+                f"Could not {'enable' if want else 'disable'} the "
+                f"WinRemoteAgent task (schtasks exit {rc}).",
+                parent=win)
+
+    chk.configure(command=_toggle_logon)
+    r += 1
+    ttk.Separator(parent).grid(row=r, column=0, columnspan=3, sticky="ew",
+                               pady=6); r += 1
+    ttk.Label(parent, text="Token:", width=20, anchor="e").grid(
+        row=r, column=0, sticky="e", padx=(0, 8), pady=2)
+
+    def _regen():
+        if not messagebox.askyesno(
+                "WinRemote — regenerate token",
+                "This writes a NEW token to token.txt and takes effect "
+                "on the next restart.\n\n"
+                "It BREAKS every configured client (including Muse's "
+                "VM copy) until they are given the new token.\n\n"
+                "Continue?", parent=win):
+            return
+        try:
+            path = os.path.join(_config_dir(), "token.txt")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(secrets.token_hex(24))
+            messagebox.showinfo(
+                "WinRemote",
+                "New token written to token.txt. Restart the agent to "
+                "use it, and give the new token to every client.",
+                parent=win)
+        except Exception as e:
+            messagebox.showerror("WinRemote", f"Token write failed: {e}",
+                                 parent=win)
+
+    ttk.Button(parent, text="Regenerate token", command=_regen).grid(
+        row=r, column=1, sticky="w"); r += 1
+
+
+def _ui_build_perms(parent):
+    import tkinter as tk
+    from tkinter import ttk
+    eff = _effective_settings()
+    paused_var = tk.BooleanVar(value=eff["permissions"]["paused"])
+    cat_vars = {name: tk.BooleanVar(value=on) for name, on
+                in eff["permissions"]["categories"].items()}
+
+    def _apply_all():
+        _apply_settings(
+            paused=bool(paused_var.get()),
+            categories={k: bool(v.get()) for k, v in cat_vars.items()})
+        _tray_refresh()
+
+    ttk.Checkbutton(parent, text="Pause all remote control",
+                    variable=paused_var, command=_apply_all).grid(
+        row=0, column=0, sticky="w", pady=(0, 6))
+    r = 1
+    for name in _CATEGORY_ROUTES:
+        ttk.Checkbutton(
+            parent,
+            text=f"{name}  ({len(_CATEGORY_ROUTES[name])} routes)",
+            variable=cat_vars[name], command=_apply_all).grid(
+            row=r, column=0, sticky="w", pady=1)
+        r += 1
+    ttk.Label(parent,
+              text="Changes apply immediately. They can only be changed "
+                   "here, on this machine — not over the API.",
+              wraplength=340, foreground="#555").grid(
+        row=r, column=0, sticky="w", pady=(10, 0))
+
+
+def _ui_quit_dialog(root, disable_autostart):
+    """Quit confirmation (UI thread). For 'Quit & disable autostart',
+    the WinRemoteAgent task is disabled FIRST and the quit aborts if
+    that fails; the WinRemoteSystem task is only touched when the
+    dialog's opt-in checkbox is checked."""
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    sessions = _session_count()
+    forwards = _forward_count()
+    dlg = tk.Toplevel(root)
+    dlg.title("WinRemote")
+    if _ui.get("icon_img") is not None:
+        try:
+            dlg.iconphoto(False, _ui["icon_img"])
+        except Exception:
+            pass
+    frm = ttk.Frame(dlg, padding=12)
+    frm.pack(fill="both", expand=True)
+    lines = ["Quit WinRemote? The HTTP API will stop answering and "
+             "remote control ends until the agent is started again."]
+    if sessions or forwards:
+        lines.append(
+            f"\n{sessions} shell session(s) and {forwards} port "
+            "forward(s) are active and will be closed.")
+    if disable_autostart:
+        lines.append(
+            "\nThe WinRemoteAgent scheduled task will also be DISABLED, "
+            "so the agent will not start at the next logon.")
+    ttk.Label(frm, text="".join(lines), wraplength=380).pack(anchor="w")
+    system_var = tk.BooleanVar(value=False)
+    if disable_autostart:
+        ttk.Checkbutton(
+            frm, text="Also disable the WinRemoteSystem helper task",
+            variable=system_var).pack(anchor="w", pady=(8, 0))
+    btns = ttk.Frame(frm)
+    btns.pack(anchor="e", pady=(12, 0))
+
+    def _cancel():
+        dlg.destroy()
+
+    def _confirm():
+        if disable_autostart:
+            rc = _schtasks(["/change", "/tn", "WinRemoteAgent", "/disable"])
+            if rc != 0:
+                messagebox.showerror(
+                    "WinRemote",
+                    f"Could not disable the WinRemoteAgent task "
+                    f"(schtasks exit {rc}). Nothing was changed.",
+                    parent=dlg)
+                return
+            if system_var.get():
+                rc = _schtasks(["/change", "/tn", "WinRemoteSystem",
+                                "/disable"])
+                if rc != 0:
+                    messagebox.showerror(
+                        "WinRemote",
+                        f"Could not disable the WinRemoteSystem task "
+                        f"(schtasks exit {rc}). Nothing was changed.",
+                        parent=dlg)
+                    return
+        dlg.destroy()
+        _shutdown_agent()
+
+    ttk.Button(btns, text="Cancel", command=_cancel).pack(side="left")
+    ttk.Button(btns, text="Quit", command=_confirm).pack(
+        side="left", padx=(8, 0))
+    dlg.resizable(False, False)
+    dlg.grab_set()
+    dlg.focus_force()
+
+
+def _ui_quit_flow(disable_autostart):
+    """Entry point for the tray Quit actions. Normally the dialog runs
+    on the UI thread; if tkinter cannot come up, fall back to a plain
+    Win32 message box so Quit always works."""
+    _ui_ensure_thread()
+    for _ in range(20):
+        if _ui.get("root") is not None:
+            _ui["requests"].put(("quit", bool(disable_autostart)))
+            return
+        time.sleep(0.05)
+    # Fallback (no UI thread): MessageBoxW confirm, then act. The
+    # WinRemoteSystem opt-in is not offered on this path.
+    try:
+        text = "Quit WinRemote?"
+        if disable_autostart:
+            text = ("Quit WinRemote and disable the WinRemoteAgent "
+                    "task (no autostart at next logon)?")
+        rc = ctypes.windll.user32.MessageBoxW(None, text, "WinRemote",
+                                              0x4 | 0x30)  # MB_YESNO|ICONWARNING
+        if rc != 6:  # IDYES
+            return
+    except Exception:
+        return
+    if disable_autostart:
+        if _schtasks(["/change", "/tn", "WinRemoteAgent", "/disable"]) != 0:
+            return
+    _shutdown_agent()
+
+
 class ThreadedHTTPServer(__import__("socketserver").ThreadingMixIn,
                          HTTPServer):
     daemon_threads = True
 
 
 def main():
-    global _server
+    global _server, _start_time
+    _start_time = time.time()
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--port", type=int, default=None,
+                    help="listen port (default: settings.json value, else 8765)")
     ap.add_argument("--token", default=os.environ.get("WINREMOTE_TOKEN", ""))
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--auto-update", dest="auto_update", action="store_true", default=None,
                     help="check GitHub for a new agent version periodically (default on)")
     ap.add_argument("--no-auto-update", dest="auto_update", action="store_false",
                     help="disable self-updates")
-    ap.add_argument("--update-interval", type=int,
-                    default=int(os.environ.get("WINREMOTE_UPDATE_INTERVAL", "600")),
-                    help="seconds between update checks (0 disables)")
-    ap.add_argument("--update-idle", type=int,
-                    default=int(os.environ.get("WINREMOTE_UPDATE_IDLE", "180")),
-                    help="only apply updates after this many idle seconds (0 = always)")
+    ap.add_argument("--update-interval", type=int, default=None,
+                    help="seconds between update checks (default: settings.json, "
+                         "else WINREMOTE_UPDATE_INTERVAL, else 600; 0 disables)")
+    ap.add_argument("--update-idle", type=int, default=None,
+                    help="only apply updates after this many idle seconds "
+                         "(default: settings.json, else WINREMOTE_UPDATE_IDLE, else 180)")
+    ap.add_argument("--no-tray", action="store_true",
+                    help="do not start the system-tray icon (canary/test instances)")
     args = ap.parse_args()
+
+    # Effective settings precedence (design SS4): CLI args > settings.json
+    # > environment > built-in defaults. The token never comes from
+    # settings.json — it stays CLI/env only, exactly as before.
+    file_settings = _load_settings_file()
+    _settings_doc.clear()
+    _settings_doc.update(file_settings)
+    _apply_permissions(file_settings.get("permissions"))
+
+    def _env_int(name, default):
+        try:
+            return int(os.environ.get(name, "") or default)
+        except ValueError:
+            return default
+
+    def _setting_int(key):
+        v = file_settings.get(key)
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    port = args.port
+    if port is None:
+        port = _setting_int("port") or 8765
+    interval = args.update_interval
+    if interval is None:
+        interval = _setting_int("update_interval_s")
+    if interval is None:
+        interval = _env_int("WINREMOTE_UPDATE_INTERVAL", 600)
+    idle = args.update_idle
+    if idle is None:
+        idle = _setting_int("update_idle_s")
+    if idle is None:
+        idle = _env_int("WINREMOTE_UPDATE_IDLE", 180)
 
     do_update = args.auto_update
     if do_update is None:
-        do_update = os.environ.get("WINREMOTE_AUTO_UPDATE", "1") == "1"
-    if args.update_interval <= 0:
+        v = file_settings.get("auto_update")
+        do_update = v if isinstance(v, bool) else (
+            os.environ.get("WINREMOTE_AUTO_UPDATE", "1") == "1")
+    if interval <= 0:
         do_update = False
     _update_state["auto"] = do_update
-    _update_state["idle_seconds"] = max(0, args.update_idle)
+    _update_state["idle_seconds"] = max(0, idle)
+    _update_state["interval_s"] = interval
+    _runtime_config.update({"port": port, "host": args.host,
+                            "no_tray": bool(args.no_tray)})
 
     if auto is None:
         print("ERROR: uiautomation not installed. Run: pip install uiautomation mss Pillow")
@@ -2046,15 +3409,21 @@ def main():
         print(f"Generated token: {token}")
 
     Handler.token = token
-    server = ThreadedHTTPServer((args.host, args.port), Handler)
+    server = ThreadedHTTPServer((args.host, port), Handler)
     _server = server
     threading.Thread(target=_prune_handles, daemon=True).start()
+    # The update loop always runs now: it re-reads _update_state["auto"]
+    # and ["interval_s"] every cycle so the tray can toggle auto-update
+    # at runtime without a restart (previously the thread only existed
+    # when updates were enabled at boot).
+    threading.Thread(target=_update_loop, args=(interval,), daemon=True).start()
     if do_update:
-        threading.Thread(target=_update_loop, args=(args.update_interval,), daemon=True).start()
-        print(f"auto-update on: checking {UPDATE_URL} every {args.update_interval}s", flush=True)
+        print(f"auto-update on: checking {UPDATE_URL} every {interval}s", flush=True)
     else:
         print("auto-update off", flush=True)
-    print(f"winremote-agent listening on {args.host}:{args.port}", flush=True)
+    print(f"winremote-agent listening on {args.host}:{port}", flush=True)
+    if not args.no_tray:
+        _tray_start()  # failure-isolated: warns and continues headless
     try:
         server.serve_forever()
     except KeyboardInterrupt:

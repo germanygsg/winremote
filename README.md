@@ -31,11 +31,22 @@ automation) — all agent-driven, no human looking at the screen.
   access; the token is defense in depth.
 - The agent runs **elevated** (highest privileges) so it can drive admin
   windows. It runs in the user's interactive session.
+- **Local control** — a system-tray icon (raw Win32, no extra
+  dependencies) gives the person at the machine a status/settings window,
+  per-category API permissions, and clean quit/restart. See
+  "Tray icon & local settings" below.
 
 ## Layout
 
 - `agent/winremote_agent.py` — the Windows agent (single file, stdlib +
-  `uiautomation`/`mss`/`Pillow`)
+  `uiautomation`/`mss`/`Pillow`). The tray icon, settings, and permission
+  gate live inside this file on purpose: the self-updater downloads
+  exactly one file, so the UI must travel with it
+- `assets/winremote.ico` / `assets/winremote.png` — the tray icon artwork
+  (flat TV-remote handset). The 16/32px renders are embedded as base64 in
+  the agent; these files are the assets of record
+- `docs/tray-frontend-design.md` — design for the tray/settings/permissions
+  feature
 - `agent/requirements.txt` — `uiautomation`, `mss`, `Pillow`
 - `agent/winremote_system.py` — companion SYSTEM service for lock-screen
   *detection* (lock-state only; lock-screen *interaction* is intentionally
@@ -89,13 +100,81 @@ f = agent.forward_add(listen_port=8080, target_port=3000)
 agent.forward_remove(f["forward_id"])
 ```
 
+## Tray icon & local settings
+
+The agent shows a tray icon in the interactive session (disable with
+`--no-tray`; the update canary always runs with it). The icon carries a
+status dot — green running, amber paused or update-staged, red when the
+server stops answering — and a tooltip with address, port, build hash,
+and state. Right-click menu:
+
+- **Status… / Settings… / Permissions…** — one window, three tabs
+  (double-clicking the icon opens it on Status). Status shows bind
+  addresses, uptime, running build vs on-disk file, update state, open
+  sessions/forwards, SYSTEM-helper health, and the token (masked, with a
+  copy button). Settings covers port (restart required), auto-update and
+  its timers, the start-at-logon task toggle, and token regeneration
+  (with a loud warning: it breaks every configured client until they get
+  the new token). Permissions is described below.
+- **Pause / Resume remote control** — pause keeps `/health` answering
+  (with `"paused": true`) while every capability call returns
+  `403 {"error": "paused by local user"}`.
+- **Check for update now**, **Restart agent**
+- **Quit**, and **Quit & disable autostart** (disables the
+  `WinRemoteAgent` task first and aborts if that fails; an opt-in
+  checkbox also disables `WinRemoteSystem`). To bring the agent back
+  after the latter, re-enable the task in Task Scheduler and start it.
+
+### settings.json
+
+Local settings live in `%APPDATA%\winremote\settings.json` (next to
+`token.txt`; the token itself is **never** in this file):
+
+```json
+{
+  "version": 1,
+  "port": 8765,
+  "auto_update": true,
+  "update_interval_s": 600,
+  "update_idle_s": 180,
+  "permissions": {
+    "paused": false,
+    "categories": {"shell": true, "files": true, "uia_input": true,
+                   "clipboard": true, "js": true, "registry": true,
+                   "proc": true, "net": true, "system": true}
+  }
+}
+```
+
+Precedence: CLI args > `settings.json` > environment > built-in
+defaults. Auto-update, its timers, and all permissions apply the moment
+the tray saves them; the port applies on the next start. A corrupt file
+is ignored with a console warning — the agent always starts on defaults.
+
+### Permissions
+
+Every API route belongs to a capability category: `shell`, `files`,
+`uia_input` (screenshots, UIA, raw input), `clipboard`, `js`, `registry`,
+`proc`, `net` (port forwards), `system` (lock-screen proxy). Turning a
+category off in the Permissions tab makes its routes return
+`403 {"error": "category disabled: <name>"}`; the master pause blocks
+all of them at once. `/health`, `GET /settings`, and `/update/check` are
+never gated.
+
+Permissions are a **local-only** control: they exist so the person at
+the machine can constrain whoever holds the token, so there is
+deliberately no API to change them. `GET /settings` (auth required)
+reports the effective settings for diagnostics, and `/health` exposes
+`paused` + `disabled_categories` so clients can back off politely.
+
 ## API reference
 
 ### Health & updates
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/health` | Health check (no auth). Returns `image_hash` (running code identity) and update status |
+| GET | `/health` | Health check (no auth). Returns `image_hash` (running code identity), update status, and the local permission state (`paused`, `disabled_categories`) |
+| GET | `/settings` | Effective settings (auth required, read-only — settings are only writable from the local tray) |
 | POST | `/update/check` | Check GitHub for a new agent version now; canary-tests and restarts into it |
 
 ### Screenshots
@@ -325,6 +404,10 @@ input into the void.
   lock-screen input.
 - Port forwards bind `0.0.0.0` — keep the host firewall tight; the API
   token is the only gate on who can open a forward.
+- Local permissions (tray Permissions tab) are the second gate: they can
+  disable whole capability categories or pause everything, and they can
+  only be changed at the machine — the API exposes them read-only, so a
+  stolen token cannot be used to widen them.
 
 ## Known limitations
 
@@ -343,6 +426,9 @@ input into the void.
   `0xC0000135`.
 - **In-memory state**: shell sessions and port forwards vanish on agent
   restart. The auto-updater restarts the agent on new versions.
+- **Tray needs the interactive session**: the agent serves its API from
+  any context, but the icon and window only exist in the logged-on
+  user's session. `--no-tray` (used by the update canary) runs headless.
 
 ## License
 
