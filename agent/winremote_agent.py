@@ -2744,6 +2744,18 @@ def _wnd_proc(hwnd, msg, wparam, lparam):
 
 
 if sys.platform == "win32":
+    # DefWindowProcW MUST be prototyped before _wnd_proc ever calls it.
+    # Undeclared, ctypes falls back to C int (32-bit) for both the result
+    # and every argument, so a pointer-sized WPARAM/LPARAM raises
+    # OverflowError inside the callback and the default procedure never
+    # runs for that message. With the tray menu open this silently broke
+    # menu rendering: the popup painted its background, separators and
+    # hover highlight but NO item text (bisected live on H410M
+    # 2026-11-02 — identical menu code, with and without this
+    # declaration; UIA could read the items either way).
+    ctypes.windll.user32.DefWindowProcW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    ctypes.windll.user32.DefWindowProcW.restype = wintypes.LPARAM
     _WNDPROC_TYPE = ctypes.WINFUNCTYPE(
         wintypes.LPARAM, wintypes.HWND, wintypes.UINT,
         wintypes.WPARAM, wintypes.LPARAM)
