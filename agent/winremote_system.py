@@ -96,6 +96,49 @@ gdi32.DeleteDC.restype = wintypes.BOOL
 gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
 gdi32.DeleteObject.restype = wintypes.BOOL
 
+# --- Session lock detection --------------------------------------------
+# The helper runs as SYSTEM in session 0. OpenInputDesktop there only sees
+# session 0's desktop, so it reported every interactive session as locked.
+# Ask Terminal Services about the active console session instead.
+wtsapi32 = ctypes.windll.wtsapi32
+
+WTS_CURRENT_SERVER_HANDLE = 0
+WTSSessionInfoEx = 25
+WTS_SESSIONSTATE_LOCK = 0
+WTS_SESSIONSTATE_UNLOCK = 1
+
+
+class WTSINFOEX_LEVEL1_W(ctypes.Structure):
+    _fields_ = [
+        ("SessionId", wintypes.ULONG),
+        ("SessionState", ctypes.c_int),
+        ("SessionFlags", ctypes.c_long),
+        ("WinStationName", wintypes.WCHAR * 33),
+        ("UserName", wintypes.WCHAR * 21),
+        ("DomainName", wintypes.WCHAR * 18),
+        ("LogonTime", ctypes.c_longlong),
+        ("ConnectTime", ctypes.c_longlong),
+        ("DisconnectTime", ctypes.c_longlong),
+        ("LastInputTime", ctypes.c_longlong),
+        ("CurrentTime", ctypes.c_longlong),
+    ]
+
+
+class WTSINFOEX_LEVEL_W(ctypes.Union):
+    _fields_ = [("Level1", WTSINFOEX_LEVEL1_W)]
+
+
+class WTSINFOEXW(ctypes.Structure):
+    _fields_ = [("Level", wintypes.DWORD), ("Data", WTSINFOEX_LEVEL_W)]
+
+
+kernel32.WTSGetActiveConsoleSessionId.restype = wintypes.DWORD
+wtsapi32.WTSQuerySessionInformationW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD)]
+wtsapi32.WTSQuerySessionInformationW.restype = wintypes.BOOL
+wtsapi32.WTSFreeMemory.argtypes = [ctypes.c_void_p]
+
 # SendInput structures (40 bytes, fixed in winremote 785a812)
 class MOUSEINPUT(ctypes.Structure):
     _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
@@ -139,20 +182,28 @@ def _open_winlogon_desktop():
 
 
 def is_locked():
-    """True if the workstation is locked (input desktop is Winlogon)."""
-    h = user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS)
-    if not h:
-        return True
+    """True if the active console session is locked.
+
+    Query Terminal Services rather than OpenInputDesktop: the helper runs
+    in session 0, where the input desktop has nothing to do with the console.
+    """
+    session_id = kernel32.WTSGetActiveConsoleSessionId()
+    if session_id == 0xFFFFFFFF:
+        return False
+    buf = ctypes.c_void_p()
+    needed = wintypes.DWORD()
+    ok = wtsapi32.WTSQuerySessionInformationW(
+        WTS_CURRENT_SERVER_HANDLE, session_id, WTSSessionInfoEx,
+        ctypes.byref(buf), ctypes.byref(needed))
+    if not ok:
+        return False
     try:
-        buf = ctypes.create_unicode_buffer(256)
-        needed = wintypes.DWORD()
-        ok = user32.GetUserObjectInformationW(
-            h, UOI_NAME, buf, 256, ctypes.byref(needed))
-        if not ok:
-            return True
-        return buf.value.lower() != "default"
+        info = ctypes.cast(buf, ctypes.POINTER(WTSINFOEXW)).contents
+        if info.Level != 1:
+            return False
+        return info.Data.Level1.SessionFlags == WTS_SESSIONSTATE_LOCK
     finally:
-        user32.CloseDesktop(h)
+        wtsapi32.WTSFreeMemory(buf)
 
 
 class _DesktopSwitcher:

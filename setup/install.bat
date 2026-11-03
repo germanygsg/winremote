@@ -18,6 +18,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM Resolve the interpreter path now. The WinRemoteSystem task runs as
+REM SYSTEM, whose PATH does not include a per-user Python install, so a
+REM bare "python" there fails with 0x80070002 (file not found).
+for /f "delims=" %%P in ('python -c "import sys; print(sys.executable)"') do set "PYTHON_EXE=%%P"
+if not defined PYTHON_EXE (
+    echo [ERROR] Could not resolve the Python executable path.
+    exit /b 1
+)
+
 echo [1/5] Installing dependencies...
 python -m pip install --upgrade pip
 python -m pip install -r "%~dp0..\agent\requirements.txt"
@@ -52,7 +61,7 @@ if errorlevel 1 (
 
 echo [4/5] Registering system helper task (WinRemoteSystem)...
 schtasks /delete /tn "WinRemoteSystem" /f >nul 2>&1
-schtasks /create /tn "WinRemoteSystem" /tr "python \"%AGENT_DIR%\winremote_system.py\"" /sc onstart /ru SYSTEM /f
+schtasks /create /tn "WinRemoteSystem" /tr "\"%PYTHON_EXE%\" \"%AGENT_DIR%\winremote_system.py\"" /sc onstart /ru SYSTEM /f
 if errorlevel 1 (
     echo [WARNING] Failed to register WinRemoteSystem task. Lock-screen support will be unavailable after reboot.
 ) else (
